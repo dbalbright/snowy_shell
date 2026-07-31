@@ -46,6 +46,7 @@ import struct
 if os.name != 'nt':
     import fcntl
     import termios
+    import tty
     import select
     import pty as pty_module
 
@@ -355,6 +356,32 @@ class ScreenBuffer:
         return cell.char, cell.sgr
 
 
+def sgr_dict_to_ansi(sgr):
+    """Convert an SGR state dict to an ANSI escape sequence string.
+    
+    Returns empty string for default/empty SGR, or a proper SGR escape
+    like '\\x1b[1;31;42m' for bold+fgre+bg.
+    """
+    if not sgr:
+        return ''
+    codes = []
+    if sgr.get('bold'):
+        codes.append('1')
+    if sgr.get('italic'):
+        codes.append('3')
+    if sgr.get('underline'):
+        codes.append('4')
+    fg = sgr.get('fg', '')
+    if fg:
+        codes.append(fg)
+    bg = sgr.get('bg', '')
+    if bg:
+        codes.append(bg)
+    if codes:
+        return '\x1b[' + ';'.join(codes) + 'm'
+    return RESET_ATTRS
+
+
 class AnsiParser:
     """Simple ANSI escape sequence parser that updates a ScreenBuffer."""
 
@@ -398,11 +425,13 @@ class AnsiParser:
                     break
 
     def _parse_csi(self):
-        """Parse a CSI (Control Sequence Introducer) sequence."""
-        # Find the end of the CSI sequence (letter terminator)
+        """Parse a CSI (Control Sequence Introducer) sequence.
+        
+        CSI sequences have the form: ESC [ params... <final_byte>
+        where final_byte is in range 0x40-0x7E (@ to ~).
+        """
         i = 2
-        while i < len(self.buffer) and self.buffer[i] not in '@$%&*^/_':
-            # Actually, CSI ends with a final byte in range 0x40-0x7E
+        while i < len(self.buffer):
             if 0x40 <= ord(self.buffer[i]) <= 0x7e:
                 break
             i += 1
@@ -592,6 +621,7 @@ class SnowyShell:
         self.width, self.height = Terminal.get_size()
         self.lock = threading.Lock()
         self.buffer_lock = threading.Lock()
+        self.resize_lock = threading.Lock()
         self.pid = os.getpid()
 
         # Unix-specific: screen buffer and PTY
@@ -674,12 +704,13 @@ class SnowyShell:
             # Check for terminal resize
             w, h = Terminal.get_size()
             if w != self.width or h != self.height:
-                self.width, self.height = w, h
-                self.init_snowflakes()
-                if self.screen_buffer:
-                    self.screen_buffer.resize(w, h)
-                if self.master_fd is not None and self.pty_proc:
-                    self._update_pty_size()
+                with self.resize_lock:
+                    self.width, self.height = w, h
+                    self.init_snowflakes()
+                    if self.screen_buffer:
+                        self.screen_buffer.resize(w, h)
+                    if self.master_fd is not None and self.pty_proc:
+                        self._update_pty_size()
 
             # Two-phase update: erase all flakes first, then read+draw
             erase_output = []
@@ -687,13 +718,14 @@ class SnowyShell:
             for flake in self.snowflakes:
                 old_x, old_y, new_x, new_y = flake.update()
 
-                # Phase 1: Erase old position by restoring saved character
+                # Phase 1: Erase old position by restoring saved character + attrs
                 if old_y is not None and 0 <= old_y < self.height and 0 <= old_x < self.width:
-                    if self.use_pty and self.screen_buffer:
-                        cell = self.screen_buffer.get_cell(old_x, old_y)
-                        if cell:
-                            sgr_ansi = cell.get_sgr_ansi()
-                            erase_output.append(f'\x1b[{old_y + 1};{old_x + 1}H{sgr_ansi}{flake.saved_char}{RESET_ATTRS}')
+                    if self.use_pty and flake.saved_sgr is not None:
+                        sgr_ansi = sgr_dict_to_ansi(flake.saved_sgr)
+                        if sgr_ansi:
+                            erase_output.append(
+                                f'\x1b[{old_y + 1};{old_x + 1}H{sgr_ansi}{flake.saved_char}{RESET_ATTRS}'
+                            )
                         else:
                             erase_output.append(f'\x1b[{old_y + 1};{old_x + 1}H{flake.saved_char}')
                     else:
@@ -714,7 +746,8 @@ class SnowyShell:
                         with self.buffer_lock:
                             char, sgr = self.screen_buffer.get_attrs_at(new_x, new_y)
                         flake.saved_char = char
-                        flake.saved_sgr = sgr
+                        # Store a copy to avoid mutation by the parser
+                        flake.saved_sgr = dict(sgr) if sgr else None
                     else:
                         flake.saved_char = read_char_at(new_x, new_y)
                         flake.saved_sgr = None
@@ -803,12 +836,13 @@ class SnowyShell:
         """Handle terminal resize."""
         w, h = Terminal.get_size()
         if w != self.width or h != self.height:
-            self.width, self.height = w, h
-            self.init_snowflakes()
-            if self.screen_buffer:
-                self.screen_buffer.resize(w, h)
-            if self.master_fd is not None:
-                self._update_pty_size()
+            with self.resize_lock:
+                self.width, self.height = w, h
+                self.init_snowflakes()
+                if self.screen_buffer:
+                    self.screen_buffer.resize(w, h)
+                if self.master_fd is not None:
+                    self._update_pty_size()
 
     def run_without_pty(self):
         """Run the snowy shell without PTY (Windows or fallback)."""
@@ -875,76 +909,97 @@ class SnowyShell:
         # Set up SIGWINCH for terminal resize
         self._setup_sigwinch()
 
-        # Create PTY pair
-        master_fd, slave_fd = pty_module.openpty()
-        self.master_fd = master_fd
-
-        # Set initial window size
-        self._update_pty_size()
-
-        # Set terminal attributes for the slave
+        # Save original terminal attributes and set raw mode
+        old_termios = None
         try:
-            attrs = termios.tcgetattr(slave_fd)
-            attrs[3] = attrs[3] & ~termios.ECHO & ~termios.ICANON
-            termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
+            old_termios = termios.tcgetattr(sys.stdin.fileno())
+            tty.setraw(sys.stdin.fileno())
         except Exception:
             pass
 
-        # Spawn shell
-        shell_cmd = self.detect_shell()
         try:
-            if self.command:
-                cmd_str = ' '.join(self.command)
-                shell_args = shlex.split(f'{shell_cmd} -c "{cmd_str}"')
-            else:
-                shell_args = shlex.split(shell_cmd)
+            # Create PTY pair
+            master_fd, slave_fd = pty_module.openpty()
+            self.master_fd = master_fd
 
-            self.pty_proc = subprocess.Popen(
-                shell_args,
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                preexec_fn=os.setsid,
-            )
-        except Exception as e:
-            os.close(master_fd)
+            # Set initial window size
+            self._update_pty_size()
+
+            # Set terminal attributes for the slave
+            try:
+                attrs = termios.tcgetattr(slave_fd)
+                attrs[3] = attrs[3] & ~termios.ECHO & ~termios.ICANON
+                termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
+            except Exception:
+                pass
+
+            # Spawn shell
+            shell_cmd = self.detect_shell()
+            try:
+                if self.command:
+                    cmd_str = ' '.join(self.command)
+                    shell_args = shlex.split(f'{shell_cmd} -c "{cmd_str}"')
+                else:
+                    shell_args = shlex.split(shell_cmd)
+
+                self.pty_proc = subprocess.Popen(
+                    shell_args,
+                    stdin=slave_fd,
+                    stdout=slave_fd,
+                    stderr=slave_fd,
+                    preexec_fn=os.setsid,
+                )
+            except Exception as e:
+                os.close(master_fd)
+                os.close(slave_fd)
+                self._restore_terminal(old_termios)
+                self.write_terminal(ALT_SCREEN_EXIT)
+                sys.stderr.write(f'Failed to start shell "{shell_cmd}": {e}\n')
+                self.running = False
+                return
+
+            # Close slave in parent
             os.close(slave_fd)
-            self.write_terminal(ALT_SCREEN_EXIT)
-            sys.stderr.write(f'Failed to start shell "{shell_cmd}": {e}\n')
-            self.running = False
-            return
 
-        # Close slave in parent
-        os.close(slave_fd)
+            # Start output reader thread
+            output_t = threading.Thread(target=self._output_reader, daemon=True)
+            output_t.start()
 
-        # Start output reader thread
-        output_t = threading.Thread(target=self._output_reader, daemon=True)
-        output_t.start()
+            # Start input forwarder thread
+            input_t = threading.Thread(target=self._input_forwarder, daemon=True)
+            input_t.start()
 
-        # Start input forwarder thread
-        input_t = threading.Thread(target=self._input_forwarder, daemon=True)
-        input_t.start()
+            # Start snow thread
+            snow_t = threading.Thread(target=self.snow_thread, daemon=True)
+            snow_t.start()
 
-        # Start snow thread
-        snow_t = threading.Thread(target=self.snow_thread, daemon=True)
-        snow_t.start()
+            # Wait for shell to exit
+            try:
+                self.pty_proc.wait()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                self.running = False
 
-        # Wait for shell to exit
-        try:
-            self.pty_proc.wait()
-        except KeyboardInterrupt:
-            pass
+            # Clean up
+            try:
+                os.close(master_fd)
+            except Exception:
+                pass
+
+            if not self.no_clear:
+                self.write_terminal(f'{CLEAR_SCREEN}{CURSOR_HOME}{ALT_SCREEN_EXIT}')
+
         finally:
-            self.running = False
+            self._restore_terminal(old_termios)
 
-        # Clean up
-        try:
-            os.close(master_fd)
-        except Exception:
-            pass
-
-        if not self.no_clear:
-            self.write_terminal(f'{CLEAR_SCREEN}{CURSOR_HOME}{ALT_SCREEN_EXIT}')
+    def _restore_terminal(self, old_termios):
+        """Restore the terminal attributes that were saved before raw mode."""
+        if old_termios is not None:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_termios)
+            except Exception:
+                pass
 
     def run(self):
         """Run the snowy shell."""

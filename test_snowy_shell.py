@@ -9,7 +9,8 @@ import signal
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from snowy_shell import (
-    Terminal, Snowflake, SnowyShell, read_char_at,
+    Terminal, Snowflake, SnowyShell, read_char_at, sgr_dict_to_ansi,
+    TerminalCell, ScreenBuffer, AnsiParser,
     SAVE_CURSOR, RESTORE_CURSOR, CLEAR_SCREEN, CURSOR_HOME,
     HIDE_CURSOR, SHOW_CURSOR, ALT_SCREEN_ENTER, ALT_SCREEN_EXIT,
     DEFAULT_SNOWFLAKES, UNICODE_SNOWFLAKES,
@@ -227,6 +228,54 @@ def test_snow_thread_saves_chars():
         assert hasattr(flake, 'saved_char'), "Flake should have saved_char"
     print("  PASS: snow thread saves characters")
 
+def test_sgr_dict_to_ansi():
+    """Test SGR dict to ANSI conversion."""
+    # Default (empty) SGR
+    assert sgr_dict_to_ansi(None) == '', "None SGR should return empty"
+    assert sgr_dict_to_ansi({}) == '', "Empty SGR should return empty"
+    # Bold
+    assert sgr_dict_to_ansi({'bold': True, 'italic': False, 'underline': False, 'fg': '', 'bg': ''}) == '\x1b[1m'
+    # Foreground color
+    assert sgr_dict_to_ansi({'bold': False, 'italic': False, 'underline': False, 'fg': '31', 'bg': ''}) == '\x1b[31m'
+    # Bold + fg
+    assert sgr_dict_to_ansi({'bold': True, 'italic': False, 'underline': False, 'fg': '32', 'bg': ''}) == '\x1b[1;32m'
+    print("  PASS: sgr_dict_to_ansi works")
+
+def test_terminal_cell():
+    """Test TerminalCell."""
+    cell = TerminalCell()
+    assert cell.char == ' ', "Default char should be space"
+    assert cell.sgr is None, "Default sgr should be None"
+    cell.set('X', {'bold': True, 'fg': '31', 'bg': '', 'italic': False, 'underline': False})
+    assert cell.char == 'X', "Char should be X"
+    sgr_ansi = cell.get_sgr_ansi()
+    assert '\x1b[1;31m' in sgr_ansi, f"SGR ANSI should include bold+red, got {sgr_ansi!r}"
+    print("  PASS: terminal cell works")
+
+def test_screen_buffer():
+    """Test ScreenBuffer."""
+    buf = ScreenBuffer(10, 5)
+    # Write a character
+    buf.set_cursor(0, 0)
+    buf.process_sgr([1, 31])  # bold + red
+    buf.write_char('A')
+    cell = buf.get_cell(0, 0)
+    assert cell is not None, "Cell should exist"
+    assert cell.char == 'A', "Cell char should be A"
+    assert cell.sgr is not None, "Cell sgr should be set"
+    assert cell.sgr.get('bold') == True, "Cell should be bold"
+    assert cell.sgr.get('fg') == '31', "Cell fg should be 31"
+    print("  PASS: screen buffer works")
+
+def test_ansi_parser_simple():
+    """Test AnsiParser with simple text."""
+    buf = ScreenBuffer(80, 24)
+    parser = AnsiParser(buf)
+    parser.feed("Hello")
+    assert buf.get_cell(0, 0).char == 'H'
+    assert buf.get_cell(4, 0).char == 'o'
+    print("  PASS: ansi parser handles simple text")
+
 if __name__ == '__main__':
     print("=" * 60)
     print("Testing snowy_shell.py")
@@ -251,6 +300,10 @@ if __name__ == '__main__':
         test_read_char_at,
         test_snowflake_saved_char,
         test_snow_thread_saves_chars,
+        test_sgr_dict_to_ansi,
+        test_terminal_cell,
+        test_screen_buffer,
+        test_ansi_parser_simple,
     ]
     
     passed = 0

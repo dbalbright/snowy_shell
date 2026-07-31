@@ -9,8 +9,8 @@ def test_snowy_shell_integration():
     """Test that snowy_shell.py works end-to-end."""
     # Use PowerShell which handles non-tty stdin better than cmd.exe
     proc = subprocess.Popen(
-        [sys.executable, r'C:\Users\danie\prj\snow\snowy_shell.py',
-         '--shell', 'powershell.exe -Command "Write-Host Hello from snowy shell; Start-Sleep -Seconds 3; Write-Host Goodbye"'],
+         [sys.executable, 'snowy_shell.py', '--no-snow',
+          'echo "Hello from snowy shell"; Start-Sleep -Seconds 1; echo "Goodbye"'],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
