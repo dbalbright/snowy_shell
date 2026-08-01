@@ -331,6 +331,25 @@ class ScreenBuffer:
                 cell.char = ' '
                 cell.sgr = None
 
+    def scroll_up(self, lines=1):
+        """Scroll the buffer up, matching the terminal's default scroll region."""
+        lines = max(0, min(lines, self.height))
+        if not lines:
+            return
+        del self.cells[:lines]
+        self.cells.extend(
+            [TerminalCell() for _ in range(self.width)]
+            for _ in range(lines)
+        )
+
+    def linefeed(self):
+        """Move down one row, scrolling when already on the last row."""
+        if self.cursor_y >= self.height - 1:
+            self.scroll_up()
+            self.cursor_y = self.height - 1
+        else:
+            self.cursor_y += 1
+
     def clear_line(self):
         """Clear from cursor to end of line."""
         if 0 <= self.cursor_y < self.height:
@@ -408,9 +427,11 @@ class AnsiParser:
 
             # Check for ESC [
             if len(self.buffer) >= 2 and self.buffer[1] == '[':
-                self._parse_csi()
+                if not self._parse_csi():
+                    break
             elif len(self.buffer) >= 2 and self.buffer[1] == ']':
-                self._parse_osc()
+                if not self._parse_osc():
+                    break
             else:
                 # Simple ESC sequence (like ESC c for reset)
                 if len(self.buffer) >= 2:
@@ -425,7 +446,7 @@ class AnsiParser:
                     break
 
     def _parse_csi(self):
-        """Parse a CSI (Control Sequence Introducer) sequence.
+        """Parse one CSI sequence, returning False when it is incomplete.
         
         CSI sequences have the form: ESC [ params... <final_byte>
         where final_byte is in range 0x40-0x7E (@ to ~).
@@ -437,7 +458,7 @@ class AnsiParser:
             i += 1
 
         if i >= len(self.buffer):
-            return  # Incomplete, wait for more data
+            return False
 
         params = self.buffer[2:i]
         command = self.buffer[i]
@@ -454,9 +475,10 @@ class AnsiParser:
                     param_list.append(int(part))
 
         self._handle_csi(command, param_list)
+        return True
 
     def _parse_osc(self):
-        """Parse an OSC (Operating System Command) sequence.
+        """Parse one OSC sequence, returning False when it is incomplete.
         
         We skip OSC sequences (they're for window titles, etc.).
         """
@@ -468,7 +490,9 @@ class AnsiParser:
             self.buffer = self.buffer[bel_idx + 1:]
         elif st_idx != -1:
             self.buffer = self.buffer[st_idx + 2:]
-        # Otherwise, leave it in buffer (incomplete)
+        else:
+            return False
+        return True
 
     def _handle_csi(self, command, params):
         """Handle a CSI command."""
@@ -530,7 +554,7 @@ class AnsiParser:
 
         elif command == 'm':
             # SGR: Select Graphic Rendition
-            self.screen.process_sgr(param_list if params else [0])
+            self.screen.process_sgr(params if params else [0])
 
         elif command == 'h' or command == 'l':
             # Set/Reset mode - we mostly ignore these for screen buffer purposes
@@ -544,8 +568,7 @@ class AnsiParser:
         """Process regular text characters."""
         for char in text:
             if char == '\n':
-                self.screen.cursor_y += 1
-                self.screen.cursor_x = 0
+                self.screen.linefeed()
             elif char == '\r':
                 self.screen.cursor_x = 0
             elif char == '\t':
@@ -560,7 +583,7 @@ class AnsiParser:
                 # Handle line wrapping
                 if self.screen.cursor_x >= self.screen.width:
                     self.screen.cursor_x = 0
-                    self.screen.cursor_y += 1
+                    self.screen.linefeed()
 
 
 class Snowflake:
@@ -656,6 +679,14 @@ class SnowyShell:
             return 'cmd.exe'
         else:
             return os.environ.get('SHELL', '/bin/bash')
+
+    @staticmethod
+    def _unix_shell_args(shell_cmd, command=None):
+        """Build Unix shell arguments without reparsing the command text."""
+        shell_args = shlex.split(shell_cmd) if isinstance(shell_cmd, str) else list(shell_cmd)
+        if command:
+            shell_args.extend(['-c', ' '.join(command)])
+        return shell_args
 
     def init_snowflakes(self):
         """Initialize snowflakes based on terminal size and density."""
@@ -771,7 +802,8 @@ class SnowyShell:
 
     def _output_reader(self):
         """Read from PTY master, parse ANSI, update screen buffer, forward to terminal."""
-        while self.running:
+        # Keep reading after the child exits so its final output is not lost.
+        while self.master_fd is not None:
             try:
                 r, _, _ = select.select([self.master_fd], [], [], 0.1)
                 if self.master_fd in r:
@@ -782,8 +814,13 @@ class SnowyShell:
 
                     # Parse ANSI and update screen buffer
                     if self.ansi_parser:
-                        with self.buffer_lock:
-                            self.ansi_parser.feed(text)
+                        try:
+                            with self.buffer_lock:
+                                self.ansi_parser.feed(text)
+                        except Exception:
+                            # Screen tracking must never prevent shell output.
+                            with self.buffer_lock:
+                                self.ansi_parser = AnsiParser(self.screen_buffer)
 
                     # Forward to real terminal
                     with self.lock:
@@ -807,6 +844,12 @@ class SnowyShell:
                 break
             except Exception:
                 break
+
+    @staticmethod
+    def _make_pty_controlling(slave_fd):
+        """Start a child session with the PTY slave as its controlling terminal."""
+        os.setsid()
+        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
 
     def signal_handler(self, signum, frame):
         """Handle signals (SIGINT, SIGTERM, SIGUSR1, SIGUSR2)."""
@@ -865,14 +908,13 @@ class SnowyShell:
                     else:
                         shell_args = [shell_cmd, '/c', cmd_str]
                 else:
-                    cmd_str = ' '.join(self.command)
-                    shell_args = shlex.split(f'{shell_cmd} -c "{cmd_str}"')
+                    shell_args = self._unix_shell_args(shell_cmd, self.command)
             else:
                 if isinstance(shell_cmd, str):
                     if os.name == 'nt':
                         shell_args = shell_cmd
                     else:
-                        shell_args = shlex.split(shell_cmd)
+                        shell_args = self._unix_shell_args(shell_cmd)
                 else:
                     shell_args = list(shell_cmd)
 
@@ -925,29 +967,20 @@ class SnowyShell:
             # Set initial window size
             self._update_pty_size()
 
-            # Set terminal attributes for the slave
-            try:
-                attrs = termios.tcgetattr(slave_fd)
-                attrs[3] = attrs[3] & ~termios.ECHO & ~termios.ICANON
-                termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
-            except Exception:
-                pass
-
             # Spawn shell
             shell_cmd = self.detect_shell()
             try:
                 if self.command:
-                    cmd_str = ' '.join(self.command)
-                    shell_args = shlex.split(f'{shell_cmd} -c "{cmd_str}"')
+                    shell_args = self._unix_shell_args(shell_cmd, self.command)
                 else:
-                    shell_args = shlex.split(shell_cmd)
+                    shell_args = self._unix_shell_args(shell_cmd)
 
                 self.pty_proc = subprocess.Popen(
                     shell_args,
                     stdin=slave_fd,
                     stdout=slave_fd,
                     stderr=slave_fd,
-                    preexec_fn=os.setsid,
+                    preexec_fn=lambda: self._make_pty_controlling(slave_fd),
                 )
             except Exception as e:
                 os.close(master_fd)
@@ -981,11 +1014,15 @@ class SnowyShell:
             finally:
                 self.running = False
 
-            # Clean up
+            # The child may exit before the reader consumes its last output.
+            output_t.join(timeout=2)
+
+            # Clean up after the output reader has drained the PTY.
             try:
                 os.close(master_fd)
             except Exception:
                 pass
+            self.master_fd = None
 
             if not self.no_clear:
                 self.write_terminal(f'{CLEAR_SCREEN}{CURSOR_HOME}{ALT_SCREEN_EXIT}')

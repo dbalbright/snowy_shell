@@ -53,10 +53,12 @@ def test_snowflake_drift():
     """Test snowflake drift (left/right movement)."""
     sf = Snowflake(80, 24, ['*'])
     sf.drift = 0.5
+    sf.x = 40
+    sf.y = 0
     initial_x = sf.x
     for _ in range(10):
         sf.update()
-    assert abs(sf.x - initial_x) > 0.01 or sf.y > 10, "Snowflake should drift or fall"
+    assert sf.x > initial_x, "Snowflake should drift to the right"
     print(f"  PASS: snowflake drift works")
 
 def test_shell_detection():
@@ -66,6 +68,12 @@ def test_shell_detection():
     print(f"Detected shell: {shell}")
     assert shell is not None, "Shell should be detected"
     print("  PASS: shell detection works")
+
+def test_unix_shell_args():
+    """Test Unix shell and command arguments preserve their boundaries."""
+    args = SnowyShell._unix_shell_args('/bin/zsh -f', ['printf "hello world\\n"'])
+    assert args == ['/bin/zsh', '-f', '-c', 'printf "hello world\\n"']
+    print("  PASS: Unix shell argument construction works")
 
 def test_snowflake_init():
     """Test snowflake initialization."""
@@ -276,6 +284,29 @@ def test_ansi_parser_simple():
     assert buf.get_cell(4, 0).char == 'o'
     print("  PASS: ansi parser handles simple text")
 
+def test_ansi_parser_split_sequences():
+    """Test ANSI sequences split across PTY reads remain resumable."""
+    buf = ScreenBuffer(80, 24)
+    parser = AnsiParser(buf)
+    parser.feed('\x1b[')
+    assert parser.buffer == '\x1b['
+    parser.feed('31mred\x1b]0;title')
+    assert buf.get_cell(0, 0).char == 'r'
+    assert buf.get_cell(0, 0).sgr.get('fg') == '31'
+    assert parser.buffer == '\x1b]0;title'
+    parser.feed('\x07X')
+    assert buf.get_cell(3, 0).char == 'X'
+    print("  PASS: ANSI parser resumes split CSI and OSC sequences")
+
+def test_screen_buffer_scrolls():
+    """Test that parsed output tracks terminal scrolling."""
+    buf = ScreenBuffer(10, 2)
+    parser = AnsiParser(buf)
+    parser.feed("first\r\nsecond\r\nthird")
+    assert ''.join(cell.char for cell in buf.cells[0]).startswith('second')
+    assert ''.join(cell.char for cell in buf.cells[1]).startswith('third')
+    print("  PASS: screen buffer handles terminal scrolling")
+
 if __name__ == '__main__':
     print("=" * 60)
     print("Testing snowy_shell.py")
@@ -287,6 +318,7 @@ if __name__ == '__main__':
         test_snowflake,
         test_snowflake_drift,
         test_shell_detection,
+        test_unix_shell_args,
         test_snowflake_init,
         test_write_terminal,
         test_batch_update,
@@ -304,6 +336,8 @@ if __name__ == '__main__':
         test_terminal_cell,
         test_screen_buffer,
         test_ansi_parser_simple,
+        test_ansi_parser_split_sequences,
+        test_screen_buffer_scrolls,
     ]
     
     passed = 0
