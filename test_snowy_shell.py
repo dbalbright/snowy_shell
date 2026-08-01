@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from snowy_shell import (
     Terminal, Snowflake, SnowyShell, read_char_at, sgr_dict_to_ansi,
-    TerminalCell, ScreenBuffer, AnsiParser,
+    TerminalCell, ScreenBuffer, AnsiParser, PtyOutputFilter,
     SAVE_CURSOR, RESTORE_CURSOR, CLEAR_SCREEN, CURSOR_HOME,
     DEC_SAVE_CURSOR, DEC_RESTORE_CURSOR,
     HIDE_CURSOR, SHOW_CURSOR, ALT_SCREEN_ENTER, ALT_SCREEN_EXIT,
@@ -208,6 +208,15 @@ def test_no_snow_option():
     assert not app.snow_enabled, "Snow should be disabled with --no-snow"
     print("  PASS: --no-snow option works")
 
+def test_unix_reserves_two_ground_rows():
+    """Test Unix shell geometry excludes the physical ground rows."""
+    app = SnowyShell()
+    if app.use_pty and app.height >= 7:
+        assert app.ground_rows == 2
+        assert app.shell_height == app.height - 2
+        assert app.screen_buffer.height == app.shell_height
+    print("  PASS: Unix reserves two ground rows")
+
 def test_pid_tracking():
     """Test PID tracking for signal-based control."""
     app = SnowyShell()
@@ -271,6 +280,92 @@ def test_overlapping_snow_restores_cell_once():
     assert output[1].count('\x1b[4;5H') == 1
     assert 'Z' in output[1]
     print("  PASS: overlapping snow restores its underlying cell once")
+
+def test_ground_accumulates_bottom_then_top():
+    """Test flakes pass through the first ground row and stack by column."""
+    app = SnowyShell(chars=['*'])
+    if not app.ground_rows:
+        return
+    flake = Snowflake(app.width, app.height, ['*'])
+    x = 5
+
+    position = app._settle_or_position(flake, x, app.shell_height)
+    assert position == (flake, x, app.shell_height)
+    assert app.ground == {}
+
+    assert app._settle_or_position(flake, x, app.height - 1) is None
+    assert app.ground[(x, app.height - 1)] == '*'
+    flake.char = '+'
+    assert app._settle_or_position(flake, x, app.shell_height) is None
+    assert app.ground[(x, app.shell_height)] == '+'
+    assert app._settle_or_position(flake, x, app.shell_height) is None
+    assert len(app.ground) == 2
+    print("  PASS: ground accumulates bottom then top")
+
+def test_ground_clears_without_reclaiming_rows():
+    """Test clearing accumulation leaves Unix shell geometry reserved."""
+    app = SnowyShell(chars=['*'])
+    if not app.ground_rows:
+        return
+    app.ground[(1, app.height - 1)] = '*'
+    output = []
+    app.write_terminal = output.append
+    shell_height = app.shell_height
+
+    with app.lock:
+        app._clear_ground_locked()
+
+    assert app.ground == {}
+    assert app.shell_height == shell_height
+    assert f'\x1b[{app.height};1H\x1b[2K' in output[0]
+    print("  PASS: clearing ground preserves reserved shell geometry")
+
+def test_ground_resize_resets_geometry():
+    """Test resize clears accumulation and recomputes shell height."""
+    app = SnowyShell(chars=['*'])
+    app.ground[(1, app.height - 1)] = '*'
+    app.write_terminal = lambda data: None
+
+    with app.lock:
+        app._resize_locked(100, 30)
+    assert app.ground == {}
+    assert (app.width, app.height, app.shell_height) == (100, 30, 28)
+    assert app.screen_buffer.height == 28
+
+    with app.lock:
+        app._resize_locked(80, 6)
+    assert app.ground_rows == 0
+    assert app.shell_height == 6
+    assert app.screen_buffer.height == 6
+    print("  PASS: resize resets ground and handles short terminals")
+
+def test_pty_output_filter_protects_ground_rows():
+    """Test child margin resets cannot reclaim protected ground rows."""
+    output_filter = PtyOutputFilter(22)
+    assert output_filter.feed('\x1b[') == ''
+    assert output_filter.feed('r') == '\x1b[1;22r'
+    assert output_filter.feed('\x1b[2;99r') == '\x1b[2;22r'
+    filtered = output_filter.feed('\x1b[?1049h')
+    assert filtered.startswith('\x1b[?1049h')
+    assert '\x1b[1;22r' in filtered
+    filtered = output_filter.feed('\x1bc')
+    assert filtered.startswith('\x1bc')
+    assert '\x1b[1;22r' in filtered
+    assert output_filter.feed('\x1bPpayload\x1b[') == ''
+    assert output_filter.feed('r\x1b\\') == '\x1bPpayload\x1b[r\x1b\\'
+    print("  PASS: PTY output filter protects ground rows")
+
+def test_screen_buffer_respects_scrolling_region():
+    """Test shell scrolling leaves physical ground rows untouched."""
+    buf = ScreenBuffer(8, 5)
+    parser = AnsiParser(buf)
+    parser.feed('\x1b[1;3r')
+    parser.feed('one\r\ntwo\r\nthree\r\nfour')
+    assert ''.join(c.char for c in buf.cells[0]).startswith('two')
+    assert ''.join(c.char for c in buf.cells[1]).startswith('three')
+    assert ''.join(c.char for c in buf.cells[2]).startswith('four')
+    assert all(c.char == ' ' for row in buf.cells[3:] for c in row)
+    print("  PASS: screen buffer preserves rows below scrolling region")
 
 def test_unix_overlay_uses_dec_cursor_save():
     """Test Unix overlay writes preserve cursor state with DEC sequences."""
@@ -417,12 +512,18 @@ if __name__ == '__main__':
         test_signal_handlers,
         test_snowflake_update_with_bounds,
         test_no_snow_option,
+        test_unix_reserves_two_ground_rows,
         test_pid_tracking,
         test_read_char_at,
         test_snowflake_saved_char,
         test_snow_thread_saves_chars,
         test_pty_output_erases_snow_before_forwarding,
         test_overlapping_snow_restores_cell_once,
+        test_ground_accumulates_bottom_then_top,
+        test_ground_clears_without_reclaiming_rows,
+        test_ground_resize_resets_geometry,
+        test_pty_output_filter_protects_ground_rows,
+        test_screen_buffer_respects_scrolling_region,
         test_unix_overlay_uses_dec_cursor_save,
         test_snow_skips_last_column_on_unix,
         test_ansi_parser_dec_cursor_save_restore,

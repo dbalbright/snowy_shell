@@ -60,6 +60,7 @@ CURSOR_HOME = '\x1b[H'
 HIDE_CURSOR = '\x1b[?25l'
 SHOW_CURSOR = '\x1b[?25h'
 RESET_ATTRS = '\x1b[0m'
+RESET_SCROLL_REGION = '\x1b[r'
 
 # Alternate screen buffer - preserves existing terminal content
 ALT_SCREEN_ENTER = '\x1b[?1049h'
@@ -232,6 +233,8 @@ class ScreenBuffer:
         self.saved_cursor_x = 0
         self.saved_cursor_y = 0
         self.saved_wrap_pending = False
+        self.scroll_top = 0
+        self.scroll_bottom = height - 1
         self.sgr_state = {}  # Current SGR state
         self._reset_sgr()
 
@@ -347,21 +350,26 @@ class ScreenBuffer:
                 cell.char = ' '
                 cell.sgr = None
 
-    def scroll_up(self, lines=1):
-        """Scroll the buffer up, matching the terminal's default scroll region."""
-        lines = max(0, min(lines, self.height))
+    def scroll_up(self, lines=1, top=None, bottom=None):
+        """Scroll rows up within the active or specified scrolling region."""
+        top = self.scroll_top if top is None else top
+        bottom = self.scroll_bottom if bottom is None else bottom
+        top = max(0, min(top, self.height - 1))
+        bottom = max(top, min(bottom, self.height - 1))
+        lines = max(0, min(lines, bottom - top + 1))
         if not lines:
             return
-        del self.cells[:lines]
-        self.cells.extend(
+        del self.cells[top:top + lines]
+        self.cells[bottom - lines + 1:bottom - lines + 1] = (
             [TerminalCell() for _ in range(self.width)]
             for _ in range(lines)
         )
 
     def linefeed(self):
         """Move down one row, scrolling when already on the last row."""
-        if self.cursor_y >= self.height - 1:
+        if self.cursor_y == self.scroll_bottom:
             self.scroll_up()
+        elif self.cursor_y >= self.height - 1:
             self.cursor_y = self.height - 1
         else:
             self.cursor_y += 1
@@ -385,6 +393,8 @@ class ScreenBuffer:
         self.saved_cursor_x = 0
         self.saved_cursor_y = 0
         self.saved_wrap_pending = False
+        self.scroll_top = 0
+        self.scroll_bottom = height - 1
         self._reset_sgr()
 
     def get_attrs_at(self, x, y):
@@ -452,6 +462,9 @@ class AnsiParser:
             elif len(self.buffer) >= 2 and self.buffer[1] == ']':
                 if not self._parse_osc():
                     break
+            elif len(self.buffer) >= 2 and self.buffer[1] in 'P_^X':
+                if not self._parse_st_string():
+                    break
             else:
                 # Simple ESC sequence (like ESC c for reset)
                 if len(self.buffer) >= 2:
@@ -461,6 +474,8 @@ class AnsiParser:
                         self.screen.cursor_x = 0
                         self.screen.cursor_y = 0
                         self.screen.wrap_pending = False
+                        self.screen.scroll_top = 0
+                        self.screen.scroll_bottom = self.screen.height - 1
                         self.screen._reset_sgr()
                     elif self.buffer[1] == '7':
                         self.screen.saved_cursor_x = self.screen.cursor_x
@@ -523,6 +538,14 @@ class AnsiParser:
             self.buffer = self.buffer[st_idx + 2:]
         else:
             return False
+        return True
+
+    def _parse_st_string(self):
+        """Skip a DCS, APC, PM, or SOS string terminated by ST."""
+        st_idx = self.buffer.find('\x1b\\', 2)
+        if st_idx == -1:
+            return False
+        self.buffer = self.buffer[st_idx + 2:]
         return True
 
     def _handle_csi(self, command, params):
@@ -606,8 +629,15 @@ class AnsiParser:
             pass
 
         elif command == 'r':
-            # Set scrolling region - we ignore this for now
-            pass
+            top = params[0] - 1 if params else 0
+            bottom = params[1] - 1 if len(params) > 1 else self.screen.height - 1
+            if 0 <= top < bottom < self.screen.height:
+                self.screen.scroll_top = top
+                self.screen.scroll_bottom = bottom
+            else:
+                self.screen.scroll_top = 0
+                self.screen.scroll_bottom = self.screen.height - 1
+            self.screen.set_cursor(0, 0)
 
     def _process_text(self, text):
         """Process regular text characters."""
@@ -631,6 +661,98 @@ class AnsiParser:
                 self.screen.write_char(char)
 
 
+class PtyOutputFilter:
+    """Keep child terminal controls inside the shell's protected row region."""
+
+    def __init__(self, shell_height):
+        self.shell_height = shell_height
+        self.buffer = ''
+
+    @property
+    def protected_region(self):
+        return f'\x1b[1;{self.shell_height}r'
+
+    def resize(self, shell_height):
+        self.shell_height = shell_height
+
+    def feed(self, text):
+        """Filter a possibly fragmented PTY output chunk."""
+        self.buffer += text
+        output = []
+        while self.buffer:
+            esc_idx = self.buffer.find('\x1b')
+            if esc_idx == -1:
+                output.append(self.buffer)
+                self.buffer = ''
+                break
+            if esc_idx:
+                output.append(self.buffer[:esc_idx])
+                self.buffer = self.buffer[esc_idx:]
+
+            if len(self.buffer) < 2:
+                break
+            if self.buffer[1] == '[':
+                end = 2
+                while end < len(self.buffer):
+                    if 0x40 <= ord(self.buffer[end]) <= 0x7e:
+                        break
+                    end += 1
+                if end >= len(self.buffer):
+                    break
+                sequence = self.buffer[:end + 1]
+                self.buffer = self.buffer[end + 1:]
+                output.append(self._filter_csi(sequence))
+            elif self.buffer[1] == ']':
+                bel_idx = self.buffer.find('\x07', 2)
+                st_idx = self.buffer.find('\x1b\\', 2)
+                if bel_idx != -1 and (st_idx == -1 or bel_idx < st_idx):
+                    end = bel_idx + 1
+                elif st_idx != -1:
+                    end = st_idx + 2
+                else:
+                    break
+                output.append(self.buffer[:end])
+                self.buffer = self.buffer[end:]
+            elif self.buffer[1] in 'P_^X':
+                st_idx = self.buffer.find('\x1b\\', 2)
+                if st_idx == -1:
+                    break
+                end = st_idx + 2
+                output.append(self.buffer[:end])
+                self.buffer = self.buffer[end:]
+            else:
+                sequence = self.buffer[:2]
+                self.buffer = self.buffer[2:]
+                output.append(sequence)
+                if sequence == '\x1bc':
+                    output.append(self._restore_region_preserving_cursor())
+        return ''.join(output)
+
+    def _filter_csi(self, sequence):
+        command = sequence[-1]
+        params = sequence[2:-1]
+        if command == 'r' and not params.startswith('?'):
+            parts = params.split(';') if params else []
+            top = self._positive_param(parts, 0, 1)
+            bottom = self._positive_param(parts, 1, self.shell_height)
+            top = min(top, max(1, self.shell_height - 1))
+            bottom = min(max(bottom, top + 1), self.shell_height)
+            return f'\x1b[{top};{bottom}r'
+
+        if command in ('h', 'l') and '?1049' in params:
+            return sequence + self._restore_region_preserving_cursor()
+        return sequence
+
+    @staticmethod
+    def _positive_param(parts, index, default):
+        if index >= len(parts) or not parts[index].isdigit():
+            return default
+        return max(1, int(parts[index]))
+
+    def _restore_region_preserving_cursor(self):
+        return DEC_SAVE_CURSOR + self.protected_region + DEC_RESTORE_CURSOR
+
+
 class Snowflake:
     """A single animated snowflake."""
 
@@ -652,7 +774,7 @@ class Snowflake:
         self.last_x = None
         self.last_y = None
 
-    def update(self):
+    def update(self, reset_at_bottom=True):
         """Update snowflake position. Returns (old_x, old_y, new_x, new_y)."""
         self.last_x = int(self.x)
         self.last_y = int(self.y)
@@ -662,7 +784,7 @@ class Snowflake:
             self.x = 0
         elif self.x >= self.width:
             self.x = self.width - 1
-        if self.y >= self.height:
+        if reset_at_bottom and self.y >= self.height:
             self.reset()
         return self.last_x, self.last_y, int(self.x), int(self.y)
 
@@ -670,6 +792,8 @@ class Snowflake:
 class SnowyShell:
     """Main snowy shell application."""
 
+    GROUND_ROWS = 2
+    MIN_SHELL_ROWS = 5
     TOGGLE_FILE = os.path.expanduser('~/.snowy_shell_toggle')
     EXIT_FILE = os.path.expanduser('~/.snowy_shell_exit')
 
@@ -687,6 +811,7 @@ class SnowyShell:
         self.shell_proc = None
         self.snowflakes = []
         self.drawn_snow = {}
+        self.ground = {}
         self.width, self.height = Terminal.get_size()
         self.lock = threading.Lock()
         self.buffer_lock = threading.Lock()
@@ -699,10 +824,18 @@ class SnowyShell:
         self.master_fd = None
         self.pty_proc = None
         self.use_pty = os.name != 'nt'
+        self.ground_rows = (
+            self.GROUND_ROWS
+            if self.use_pty and self.height - self.GROUND_ROWS >= self.MIN_SHELL_ROWS
+            else 0
+        )
+        self.shell_height = self.height - self.ground_rows
+        self.output_filter = None
 
         if self.use_pty:
-            self.screen_buffer = ScreenBuffer(self.width, self.height)
+            self.screen_buffer = ScreenBuffer(self.width, self.shell_height)
             self.ansi_parser = AnsiParser(self.screen_buffer)
+            self.output_filter = PtyOutputFilter(self.shell_height)
 
         # Clean up any stale control files
         for f in [self.TOGGLE_FILE, self.EXIT_FILE]:
@@ -783,6 +916,15 @@ class SnowyShell:
         max_x = self.width - 1 if self.use_pty else self.width
         return 0 <= x < max_x and 0 <= y < self.height
 
+    def _underlying_cell(self, x, y):
+        """Return the shell or ground content beneath a transient flake."""
+        if self.use_pty and y >= self.shell_height:
+            return self.ground.get((x, y), ' '), None
+        if self.use_pty and self.screen_buffer:
+            with self.buffer_lock:
+                return self.screen_buffer.get_attrs_at(x, y)
+        return read_char_at(x, y), None
+
     def _erase_snow_locked(self):
         """Erase the currently visible overlay while holding self.lock."""
         if not self.drawn_snow:
@@ -793,9 +935,8 @@ class SnowyShell:
             if not self._valid_snow_position(x, y):
                 continue
 
-            if self.use_pty and self.screen_buffer:
-                with self.buffer_lock:
-                    saved_char, saved_sgr = self.screen_buffer.get_attrs_at(x, y)
+            if self.use_pty:
+                saved_char, saved_sgr = self._underlying_cell(x, y)
 
             output.append(
                 self._format_restored_cell(x, y, saved_char, saved_sgr)
@@ -815,9 +956,8 @@ class SnowyShell:
 
             cell_position = (x, y)
             if cell_position not in covered_cells:
-                if self.use_pty and self.screen_buffer:
-                    with self.buffer_lock:
-                        char, sgr = self.screen_buffer.get_attrs_at(x, y)
+                if self.use_pty:
+                    char, sgr = self._underlying_cell(x, y)
                 else:
                     char = read_char_at(x, y)
                     sgr = None
@@ -832,19 +972,106 @@ class SnowyShell:
             self._write_overlay(''.join(output))
         self.drawn_snow = covered_cells
 
+    def _draw_ground_locked(self):
+        """Redraw settled snow in the two protected physical rows."""
+        if not self.ground:
+            return
+        output = [
+            f'\x1b[{y + 1};{x + 1}H{char}'
+            for (x, y), char in sorted(self.ground.items())
+            if self._valid_snow_position(x, y)
+        ]
+        if output:
+            self._write_overlay(''.join(output))
+
+    def _clear_ground_locked(self):
+        """Clear settled snow while preserving the two reserved rows."""
+        if not self.ground:
+            return
+        self.ground = {}
+        if not self.ground_rows:
+            return
+        output = ''.join(
+            f'\x1b[{row + 1};1H\x1b[2K'
+            for row in range(self.shell_height, self.height)
+        )
+        self._write_overlay(output)
+
+    def _settle_or_position(self, flake, x, y):
+        """Settle a flake in its column or return its transient position."""
+        if not self.ground_rows or y < self.shell_height:
+            return flake, x, y
+
+        x = min(x, self.width - 2)
+        bottom_y = self.height - 1
+        top_y = self.shell_height
+        if (x, bottom_y) not in self.ground:
+            target_y = bottom_y
+        elif (x, top_y) not in self.ground:
+            target_y = top_y
+        else:
+            flake.reset()
+            return None
+
+        if y >= target_y:
+            self.ground[(x, target_y)] = flake.char
+            flake.reset()
+            return None
+        return flake, x, y
+
+    def _set_terminal_region_locked(self):
+        """Apply the outer terminal scrolling region for the child shell."""
+        if not self.use_pty:
+            return
+        if self.ground_rows:
+            region = f'\x1b[1;{self.shell_height}r'
+        else:
+            region = RESET_SCROLL_REGION
+        self.write_terminal(DEC_SAVE_CURSOR + region + DEC_RESTORE_CURSOR)
+
+    def _reset_terminal_region_locked(self):
+        if self.use_pty:
+            self.write_terminal(
+                DEC_SAVE_CURSOR + RESET_SCROLL_REGION + DEC_RESTORE_CURSOR
+            )
+
     def _forward_pty_output(self, text):
         """Remove snow, update the screen model, then forward one PTY chunk."""
         with self.lock:
             self._erase_snow_locked()
+            filtered = self.output_filter.feed(text) if self.output_filter else text
             if self.ansi_parser:
                 try:
                     with self.buffer_lock:
-                        self.ansi_parser.feed(text)
+                        self.ansi_parser.feed(filtered)
                 except Exception:
                     # Screen tracking must never prevent shell output.
                     with self.buffer_lock:
                         self.ansi_parser = AnsiParser(self.screen_buffer)
-            self.write_terminal(text)
+            self.write_terminal(filtered)
+            self._draw_ground_locked()
+
+    def _resize_locked(self, width, height):
+        """Resize physical, shell, snow, and PTY geometry while locked."""
+        self._erase_snow_locked()
+        self._clear_ground_locked()
+        self.width, self.height = width, height
+        self.ground_rows = (
+            self.GROUND_ROWS
+            if self.use_pty and height - self.GROUND_ROWS >= self.MIN_SHELL_ROWS
+            else 0
+        )
+        self.shell_height = height - self.ground_rows
+        self.init_snowflakes()
+        if self.screen_buffer:
+            with self.buffer_lock:
+                self.screen_buffer.resize(width, self.shell_height)
+                self.ansi_parser = AnsiParser(self.screen_buffer)
+        if self.output_filter:
+            self.output_filter.resize(self.shell_height)
+        if self.master_fd is not None:
+            self._update_pty_size()
+        self._set_terminal_region_locked()
 
     def snow_thread(self):
         """Background thread that animates snowflakes."""
@@ -860,6 +1087,7 @@ class SnowyShell:
             if not self.snow_enabled:
                 with self.lock:
                     self._erase_snow_locked()
+                    self._clear_ground_locked()
                 time.sleep(0.1)
                 continue
 
@@ -868,23 +1096,20 @@ class SnowyShell:
             if w != self.width or h != self.height:
                 with self.resize_lock:
                     with self.lock:
-                        self._erase_snow_locked()
-                        self.width, self.height = w, h
-                        self.init_snowflakes()
-                        if self.screen_buffer:
-                            with self.buffer_lock:
-                                self.screen_buffer.resize(w, h)
-                        if self.master_fd is not None and self.pty_proc:
-                            self._update_pty_size()
-
-            new_positions = []
-            for flake in self.snowflakes:
-                _, _, new_x, new_y = flake.update()
-                new_positions.append((flake, new_x, new_y))
+                        self._resize_locked(w, h)
 
             with self.lock:
                 self._erase_snow_locked()
+                new_positions = []
+                for flake in self.snowflakes:
+                    _, _, new_x, new_y = flake.update(
+                        reset_at_bottom=not bool(self.ground_rows)
+                    )
+                    position = self._settle_or_position(flake, new_x, new_y)
+                    if position is not None:
+                        new_positions.append(position)
                 self._draw_snow_locked(new_positions)
+                self._draw_ground_locked()
 
             time.sleep(0.05 / max(0.1, self.speed))
 
@@ -892,7 +1117,7 @@ class SnowyShell:
         """Update the PTY window size to match the terminal."""
         if self.master_fd is not None:
             try:
-                winsize = struct.pack('HHHH', self.height, self.width, 0, 0)
+                winsize = struct.pack('HHHH', self.shell_height, self.width, 0, 0)
                 fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
             except Exception:
                 pass
@@ -966,14 +1191,7 @@ class SnowyShell:
         if w != self.width or h != self.height:
             with self.resize_lock:
                 with self.lock:
-                    self._erase_snow_locked()
-                    self.width, self.height = w, h
-                    self.init_snowflakes()
-                    if self.screen_buffer:
-                        with self.buffer_lock:
-                            self.screen_buffer.resize(w, h)
-                    if self.master_fd is not None:
-                        self._update_pty_size()
+                    self._resize_locked(w, h)
 
     def run_without_pty(self):
         """Run the snowy shell without PTY (Windows or fallback)."""
@@ -1039,12 +1257,15 @@ class SnowyShell:
             self.write_terminal(ALT_SCREEN_ENTER)
 
         self.write_terminal(f'{CLEAR_SCREEN}{CURSOR_HOME}')
+        with self.lock:
+            self._set_terminal_region_locked()
 
         # Set up SIGWINCH for terminal resize
         self._setup_sigwinch()
 
         # Save original terminal attributes and set raw mode
         old_termios = None
+        terminal_cleaned = False
         try:
             old_termios = termios.tcgetattr(sys.stdin.fileno())
             tty.setraw(sys.stdin.fileno())
@@ -1078,6 +1299,9 @@ class SnowyShell:
                 os.close(master_fd)
                 os.close(slave_fd)
                 self._restore_terminal(old_termios)
+                with self.lock:
+                    self._reset_terminal_region_locked()
+                    terminal_cleaned = True
                 self.write_terminal(ALT_SCREEN_EXIT)
                 sys.stderr.write(f'Failed to start shell "{shell_cmd}": {e}\n')
                 self.running = False
@@ -1108,9 +1332,12 @@ class SnowyShell:
 
             # Stop snow first, then let the reader drain the child's last output.
             snow_t.join(timeout=1)
+            output_t.join(timeout=2)
             with self.lock:
                 self._erase_snow_locked()
-            output_t.join(timeout=2)
+                self._clear_ground_locked()
+                self._reset_terminal_region_locked()
+                terminal_cleaned = True
 
             # Clean up after the output reader has drained the PTY.
             try:
@@ -1123,6 +1350,11 @@ class SnowyShell:
                 self.write_terminal(f'{CLEAR_SCREEN}{CURSOR_HOME}{ALT_SCREEN_EXIT}')
 
         finally:
+            if not terminal_cleaned:
+                with self.lock:
+                    self._erase_snow_locked()
+                    self._clear_ground_locked()
+                    self._reset_terminal_region_locked()
             self._restore_terminal(old_termios)
 
     def _restore_terminal(self, old_termios):

@@ -3,6 +3,7 @@
 
 import os
 import pty
+import re
 import select
 import subprocess
 import sys
@@ -155,9 +156,96 @@ def test_scrolling_output_preserves_text():
     screen = ScreenBuffer(80, 24)
     AnsiParser(screen).feed(proc.stdout.decode('utf-8', errors='replace'))
     lines = [''.join(cell.char for cell in row).rstrip() for row in screen.cells]
-    expected = [f'ROW{i:02d} preserved text' for i in range(18, 41)] + ['']
+    expected = [f'ROW{i:02d} preserved text' for i in range(20, 41)] + ['', '', '']
     assert lines == expected, '\n'.join(lines)
     print('Scrolling output text preservation test passed')
+    return True
+
+def test_child_pty_excludes_ground_rows():
+    """Verify the Unix child sees a terminal two rows shorter."""
+    if os.name == 'nt':
+        return True
+    proc = subprocess.run(
+        [
+            sys.executable, 'snowy_shell.py', '--no-clear', '--no-snow',
+            '--shell', '/bin/sh', 'stty size',
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert '22 80' in proc.stdout, repr(proc.stdout)
+    assert '\x1b[1;22r' in proc.stdout
+    assert '\x1b[r' in proc.stdout
+    print('Child PTY ground reservation test passed')
+    return True
+
+def test_snow_accumulates_in_reserved_rows():
+    """Verify live Unix snow reaches and fills both protected rows."""
+    if os.name == 'nt':
+        return True
+    proc = subprocess.run(
+        [
+            sys.executable, 'snowy_shell.py', '--no-clear',
+            '--shell', '/bin/sh', '--density', '10', '--speed', '4',
+            '--chars', '*', 'sleep 0.8',
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert re.search(r'\x1b\[23;\d+H\*', proc.stdout)
+    assert re.search(r'\x1b\[24;\d+H\*', proc.stdout)
+    print('Live Unix ground accumulation test passed')
+    return True
+
+def test_scrolling_output_stays_above_live_ground():
+    """Verify active shell output and accumulated snow occupy separate rows."""
+    if os.name == 'nt':
+        return True
+    command = (
+        "sleep 0.4; i=1; while [ $i -le 35 ]; do "
+        "printf 'SAFE_ROW_%02d\\n' $i; i=$((i + 1)); done; sleep 0.5"
+    )
+    proc = subprocess.run(
+        [
+            sys.executable, 'snowy_shell.py', '--no-clear',
+            '--shell', '/bin/sh', '--density', '10', '--speed', '4',
+            '--chars', '*', command,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert re.search(r'\x1b\[23;\d+H\*', proc.stdout)
+    assert re.search(r'\x1b\[24;\d+H\*', proc.stdout)
+
+    # After the output has scrolled into its final layout, every non-snow
+    # overlay write must restore the exact character at that shell cell.
+    marker = proc.stdout.find('SAFE_ROW_35') + len('SAFE_ROW_35')
+    expected = {}
+    for row, number in enumerate(range(15, 36), 1):
+        for column, char in enumerate(f'SAFE_ROW_{number:02d}', 1):
+            expected[(row, column)] = char
+    writes = re.finditer(
+        r'\x1b\[(\d+);(\d+)H(?:\x1b\[[0-9;]*m)?([^\x1b])',
+        proc.stdout[marker:],
+    )
+    for match in writes:
+        row, column = int(match.group(1)), int(match.group(2))
+        char = match.group(3)
+        if row <= 22 and char != '*':
+            assert char == expected.get((row, column), ' ')
+    print('Scrolling output and live ground isolation test passed')
     return True
 
 def test_repeated_zsh_listings_preserve_text():
@@ -192,7 +280,9 @@ def test_repeated_zsh_listings_preserve_text():
     )
     expected = ScreenBuffer(80, 24)
     expected_text = expected_proc.stdout.decode('utf-8', errors='replace')
-    AnsiParser(expected).feed(expected_text.replace('\n', '\r\n'))
+    AnsiParser(expected).feed(
+        '\x1b[1;22r' + expected_text.replace('\n', '\r\n')
+    )
 
     actual_lines = [''.join(c.char for c in row) for row in actual.cells]
     expected_lines = [''.join(c.char for c in row) for row in expected.cells]
@@ -206,5 +296,8 @@ if __name__ == '__main__':
         success = test_unix_interactive_shell('/bin/zsh -f') and success
     success = test_snowy_shell_integration() and success
     success = test_scrolling_output_preserves_text() and success
+    success = test_child_pty_excludes_ground_rows() and success
+    success = test_snow_accumulates_in_reserved_rows() and success
+    success = test_scrolling_output_stays_above_live_ground() and success
     success = test_repeated_zsh_listings_preserve_text() and success
     sys.exit(0 if success else 1)
