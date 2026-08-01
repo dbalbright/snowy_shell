@@ -773,6 +773,7 @@ class Snowflake:
         self.drift = random.uniform(-0.5, 0.5)
         self.last_x = None
         self.last_y = None
+        self.ground_target = None
 
     def update(self, reset_at_bottom=True):
         """Update snowflake position. Returns (old_x, old_y, new_x, new_y)."""
@@ -986,6 +987,8 @@ class SnowyShell:
 
     def _clear_ground_locked(self):
         """Clear settled snow while preserving the two reserved rows."""
+        for flake in self.snowflakes:
+            flake.ground_target = None
         if not self.ground:
             return
         self.ground = {}
@@ -1005,13 +1008,15 @@ class SnowyShell:
         x = min(x, self.width - 2)
         bottom_y = self.height - 1
         top_y = self.shell_height
-        if (x, bottom_y) not in self.ground:
+        if flake.ground_target is not None:
+            x, target_y = flake.ground_target
+        elif (x, bottom_y) not in self.ground:
             target_y = bottom_y
         elif (x, top_y) not in self.ground:
             target_y = top_y
         else:
-            flake.reset()
-            return None
+            target_y = bottom_y if random.random() < 0.5 else top_y
+            flake.ground_target = (x, target_y)
 
         if y >= target_y:
             self.ground[(x, target_y)] = flake.char

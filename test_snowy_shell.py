@@ -4,6 +4,7 @@
 import os
 import sys
 import signal
+from unittest.mock import patch
 
 # Add the project directory to the path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -302,12 +303,46 @@ def test_ground_accumulates_bottom_then_top():
     assert len(app.ground) == 2
     print("  PASS: ground accumulates bottom then top")
 
+def test_full_ground_columns_refresh_on_impact():
+    """Test full columns replace either settled row after penetration."""
+    app = SnowyShell(chars=['*'])
+    if not app.ground_rows:
+        return
+    x = 5
+    top_y = app.shell_height
+    bottom_y = app.height - 1
+    app.ground[(x, top_y)] = '+'
+    app.ground[(x, bottom_y)] = '*'
+
+    bottom_flake = Snowflake(app.width, app.height, ['o'])
+    bottom_flake.char = 'o'
+    with patch('snowy_shell.random.random', return_value=0.0):
+        position = app._settle_or_position(bottom_flake, x, top_y)
+    assert position == (bottom_flake, x, top_y)
+    assert bottom_flake.ground_target == (x, bottom_y)
+    assert app.ground[(x, top_y)] == '+'
+    assert app._settle_or_position(bottom_flake, x + 1, bottom_y) is None
+    assert app.ground[(x, bottom_y)] == 'o'
+    assert bottom_flake.ground_target is None
+
+    top_flake = Snowflake(app.width, app.height, ['.'])
+    top_flake.char = '.'
+    with patch('snowy_shell.random.random', return_value=1.0):
+        assert app._settle_or_position(top_flake, x, top_y) is None
+    assert app.ground[(x, top_y)] == '.'
+    assert app.ground[(x, bottom_y)] == 'o'
+    assert len(app.ground) == 2
+    print("  PASS: full ground columns refresh either settled row")
+
 def test_ground_clears_without_reclaiming_rows():
     """Test clearing accumulation leaves Unix shell geometry reserved."""
     app = SnowyShell(chars=['*'])
     if not app.ground_rows:
         return
     app.ground[(1, app.height - 1)] = '*'
+    flake = Snowflake(app.width, app.height, ['*'])
+    flake.ground_target = (1, app.height - 1)
+    app.snowflakes = [flake]
     output = []
     app.write_terminal = output.append
     shell_height = app.shell_height
@@ -316,6 +351,7 @@ def test_ground_clears_without_reclaiming_rows():
         app._clear_ground_locked()
 
     assert app.ground == {}
+    assert flake.ground_target is None
     assert app.shell_height == shell_height
     assert f'\x1b[{app.height};1H\x1b[2K' in output[0]
     print("  PASS: clearing ground preserves reserved shell geometry")
@@ -520,6 +556,7 @@ if __name__ == '__main__':
         test_pty_output_erases_snow_before_forwarding,
         test_overlapping_snow_restores_cell_once,
         test_ground_accumulates_bottom_then_top,
+        test_full_ground_columns_refresh_on_impact,
         test_ground_clears_without_reclaiming_rows,
         test_ground_resize_resets_geometry,
         test_pty_output_filter_protects_ground_rows,
