@@ -2,12 +2,14 @@
 """Integration tests for snowy_shell.py."""
 
 import os
-import pty
 import re
 import select
 import subprocess
 import sys
 import time
+
+if os.name != 'nt':
+    import pty
 
 from snowy_shell import AnsiParser, ScreenBuffer
 

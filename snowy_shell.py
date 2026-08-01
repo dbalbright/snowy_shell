@@ -42,6 +42,186 @@ import signal
 import shlex
 import struct
 
+
+class _WindowsCoord(ctypes.Structure):
+    _fields_ = [('X', ctypes.c_short), ('Y', ctypes.c_short)]
+
+
+class _WindowsSmallRect(ctypes.Structure):
+    _fields_ = [
+        ('Left', ctypes.c_short),
+        ('Top', ctypes.c_short),
+        ('Right', ctypes.c_short),
+        ('Bottom', ctypes.c_short),
+    ]
+
+
+class _WindowsCharUnion(ctypes.Union):
+    _fields_ = [
+        ('UnicodeChar', ctypes.c_wchar),
+        ('AsciiChar', ctypes.c_char),
+    ]
+
+
+class _WindowsCharInfo(ctypes.Structure):
+    _anonymous_ = ('Char',)
+    _fields_ = [
+        ('Char', _WindowsCharUnion),
+        ('Attributes', ctypes.c_ushort),
+    ]
+
+
+class _WindowsConsoleInfo(ctypes.Structure):
+    _fields_ = [
+        ('dwSize', _WindowsCoord),
+        ('dwCursorPosition', _WindowsCoord),
+        ('wAttributes', ctypes.c_ushort),
+        ('srWindow', _WindowsSmallRect),
+        ('dwMaximumWindowSize', _WindowsCoord),
+    ]
+
+
+def _windows_console_handle():
+    """Return a readable/writable console output handle, if available."""
+    if os.name != 'nt':
+        return None
+
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.GetStdHandle(-11)
+    mode = ctypes.c_uint32()
+    if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        return handle
+
+    handle = kernel32.CreateFileW(
+        'CONOUT$',
+        0xC0000000,
+        0x3,
+        None,
+        0x3,
+        0,
+        None,
+    )
+    return handle if handle not in (None, -1) else None
+
+
+def _windows_console_info(handle):
+    """Read console geometry and current attributes."""
+    info = _WindowsConsoleInfo()
+    kernel32 = ctypes.windll.kernel32
+    if not kernel32.GetConsoleScreenBufferInfo(handle, ctypes.byref(info)):
+        return None
+    return info
+
+
+def _windows_cell_position(handle, x, y):
+    """Convert a terminal-relative position to a screen-buffer position."""
+    info = _windows_console_info(handle)
+    if info is None:
+        return None
+    return _WindowsCoord(
+        info.srWindow.Left + x,
+        info.srWindow.Top + y,
+    )
+
+
+def _read_console_cell_windows(x, y):
+    """Read one visible Windows console cell as ``(character, attributes)``."""
+    try:
+        handle = _windows_console_handle()
+        if handle is None:
+            return None
+        position = _windows_cell_position(handle, x, y)
+        if position is None:
+            return None
+
+        cell = _WindowsCharInfo()
+        buffer_size = _WindowsCoord(1, 1)
+        buffer_position = _WindowsCoord(0, 0)
+        region = _WindowsSmallRect(
+            position.X, position.Y, position.X, position.Y
+        )
+        kernel32 = ctypes.windll.kernel32
+        if not kernel32.ReadConsoleOutputW(
+            handle,
+            ctypes.byref(cell),
+            buffer_size,
+            buffer_position,
+            ctypes.byref(region),
+        ):
+            return None
+        return cell.UnicodeChar or ' ', int(cell.Attributes)
+    except Exception:
+        return None
+
+
+def _write_console_cell_windows(x, y, char, attributes):
+    """Write one visible Windows console cell without moving the cursor."""
+    try:
+        handle = _windows_console_handle()
+        if handle is None:
+            return False
+        position = _windows_cell_position(handle, x, y)
+        if position is None:
+            return False
+
+        cell = _WindowsCharInfo()
+        cell.UnicodeChar = (char or ' ')[0]
+        cell.Attributes = int(attributes)
+        buffer_size = _WindowsCoord(1, 1)
+        buffer_position = _WindowsCoord(0, 0)
+        region = _WindowsSmallRect(
+            position.X, position.Y, position.X, position.Y
+        )
+        kernel32 = ctypes.windll.kernel32
+        return bool(kernel32.WriteConsoleOutputW(
+            handle,
+            ctypes.byref(cell),
+            buffer_size,
+            buffer_position,
+            ctypes.byref(region),
+        ))
+    except Exception:
+        return False
+
+
+def _clear_console_region_windows(start_y, end_y, width, attributes):
+    """Clear a visible Windows console region with exact character attributes."""
+    try:
+        handle = _windows_console_handle()
+        if handle is None:
+            return False
+        info = _windows_console_info(handle)
+        if info is None:
+            return False
+
+        kernel32 = ctypes.windll.kernel32
+        for y in range(start_y, end_y):
+            cells = (_WindowsCharInfo * width)()
+            for cell in cells:
+                cell.UnicodeChar = ' '
+                cell.Attributes = int(attributes)
+            position = _WindowsCoord(
+                info.srWindow.Left,
+                info.srWindow.Top + y,
+            )
+            region = _WindowsSmallRect(
+                position.X,
+                position.Y,
+                position.X + width - 1,
+                position.Y,
+            )
+            if not kernel32.WriteConsoleOutputW(
+                handle,
+                cells,
+                _WindowsCoord(width, 1),
+                _WindowsCoord(0, 0),
+                ctypes.byref(region),
+            ):
+                return False
+        return True
+    except Exception:
+        return False
+
 # Unix-only imports
 if os.name != 'nt':
     import fcntl
@@ -87,6 +267,10 @@ def read_char_at(x, y):
 
 def _read_char_at_windows(x, y):
     """Read a character from the Windows console at (x, y)."""
+    cell = _read_console_cell_windows(x, y)
+    if cell is not None:
+        return cell[0]
+
     try:
         kernel32 = ctypes.windll.kernel32
         STD_OUTPUT_HANDLE = -11
@@ -188,9 +372,18 @@ class TerminalCell:
         self.sgr = None  # SGR state dict or None for default
 
     def set(self, char, sgr):
-        """Set the cell content."""
+        """Set the cell content, normalizing default attributes to None."""
         self.char = char
-        self.sgr = dict(sgr) if sgr else None
+        if not sgr:
+            self.sgr = None
+            return
+        state = dict(sgr)
+        if (not state.get('bold') and not state.get('italic')
+                and not state.get('underline')
+                and not state.get('fg') and not state.get('bg')):
+            self.sgr = None
+        else:
+            self.sgr = state
 
     def get_sgr_ansi(self):
         """Get the ANSI escape sequence for this cell's SGR attributes."""
@@ -812,6 +1005,7 @@ class SnowyShell:
         self.shell_proc = None
         self.snowflakes = []
         self.drawn_snow = {}
+        self.drawn_snow_chars = {}
         self.ground = {}
         self.width, self.height = Terminal.get_size()
         self.lock = threading.Lock()
@@ -819,7 +1013,7 @@ class SnowyShell:
         self.resize_lock = threading.Lock()
         self.pid = os.getpid()
 
-        # Unix-specific: screen buffer and PTY
+        # The screen model is only authoritative when a real PTY is present.
         self.screen_buffer = None
         self.ansi_parser = None
         self.master_fd = None
@@ -832,6 +1026,10 @@ class SnowyShell:
         )
         self.shell_height = self.height - self.ground_rows
         self.output_filter = None
+
+        self.windows_snow_attributes = None
+        self.drawn_snow_console = {}
+        self.drawn_snow_overlay_attributes = {}
 
         if self.use_pty:
             self.screen_buffer = ScreenBuffer(self.width, self.shell_height)
@@ -897,13 +1095,92 @@ class SnowyShell:
 
         return False
 
+    def _is_windows_direct_console(self):
+        """Return whether Windows console cells can be managed directly."""
+        return os.name == 'nt' and not self.use_pty
+
+    def _windows_snow_attributes(self):
+        """Return stable default attributes for transient snow cells."""
+        if self.windows_snow_attributes is not None:
+            return self.windows_snow_attributes
+
+        attributes = 0x0007
+        handle = _windows_console_handle()
+        if handle is not None:
+            info = _windows_console_info(handle)
+            if info is not None:
+                # Preserve the terminal background, but never inherit a shell
+                # foreground color for transient snow.
+                attributes = (int(info.wAttributes) & 0xFFF0) | 0x0007
+        self.windows_snow_attributes = attributes
+        return attributes
+
+    def _erase_windows_snow_locked(self):
+        """Restore Windows cells only while they still contain our overlay."""
+        for (x, y), saved_cell in self.drawn_snow_console.items():
+            expected_char = self.drawn_snow_chars.get((x, y))
+            expected_attributes = self.drawn_snow_overlay_attributes.get(
+                (x, y)
+            )
+            if expected_char is None or expected_attributes is None:
+                continue
+            current_cell = _read_console_cell_windows(x, y)
+            if current_cell != (expected_char, expected_attributes):
+                continue
+            _write_console_cell_windows(
+                x, y, saved_cell[0], saved_cell[1]
+            )
+
+        self.drawn_snow = {}
+        self.drawn_snow_chars = {}
+        self.drawn_snow_console = {}
+        self.drawn_snow_overlay_attributes = {}
+
+    def _draw_windows_snow_locked(self, positions):
+        """Draw snow through the Windows console API and save exact cells."""
+        covered_cells = {}
+        drawn_chars = {}
+        saved_cells = {}
+        overlay_attributes = {}
+        snow_attributes = self._windows_snow_attributes()
+
+        for flake, x, y in positions:
+            if not self._valid_snow_position(x, y):
+                continue
+
+            cell_position = (x, y)
+            if cell_position not in saved_cells:
+                saved_cell = _read_console_cell_windows(x, y)
+                if saved_cell is None:
+                    continue
+                saved_cells[cell_position] = saved_cell
+
+            if not _write_console_cell_windows(
+                x, y, flake.char, snow_attributes
+            ):
+                continue
+
+            saved_cell = saved_cells[cell_position]
+            covered_cells[cell_position] = (saved_cell[0], None)
+            drawn_chars[cell_position] = flake.char
+            overlay_attributes[cell_position] = snow_attributes
+            flake.saved_char = saved_cell[0]
+            flake.saved_sgr = None
+
+        self.drawn_snow = covered_cells
+        self.drawn_snow_chars = drawn_chars
+        self.drawn_snow_console = {
+            cell: saved_cells[cell] for cell in covered_cells
+        }
+        self.drawn_snow_overlay_attributes = overlay_attributes
+
     def _format_restored_cell(self, x, y, char, sgr):
         """Build the terminal sequence that restores one snow-covered cell."""
         position = f'\x1b[{y + 1};{x + 1}H'
         sgr_ansi = sgr_dict_to_ansi(sgr)
         if sgr_ansi:
             return f'{position}{sgr_ansi}{char}{RESET_ATTRS}'
-        return f'{position}{char}'
+        return f'{position}{RESET_ATTRS}{char}'
 
     def _write_overlay(self, output):
         """Write an overlay update without disturbing the shell cursor."""
@@ -927,13 +1204,28 @@ class SnowyShell:
 
     def _erase_snow_locked(self):
         """Erase the currently visible overlay while holding self.lock."""
+        if (
+            self._is_windows_direct_console()
+            and self.drawn_snow_console
+        ):
+            self._erase_windows_snow_locked()
+            return
+
         if not self.drawn_snow:
+            self.drawn_snow_chars = {}
             return
 
         output = []
         for (x, y), (saved_char, saved_sgr) in self.drawn_snow.items():
             if not self._valid_snow_position(x, y):
                 continue
+
+            # The fallback path shares the console with the child shell. Do
+            # not restore a cell that the shell has changed since we drew it.
+            if not self.use_pty and y < self.shell_height:
+                drawn_char = self.drawn_snow_chars.get((x, y))
+                if drawn_char is None or read_char_at(x, y) != drawn_char:
+                    continue
 
             if self.use_pty or (self.ground_rows and y >= self.shell_height):
                 saved_char, saved_sgr = self._underlying_cell(x, y)
@@ -945,11 +1237,20 @@ class SnowyShell:
         if output:
             self._write_overlay(''.join(output))
         self.drawn_snow = {}
+        self.drawn_snow_chars = {}
 
     def _draw_snow_locked(self, positions):
         """Draw a snow frame and record each covered cell while holding self.lock."""
+        if (
+            self._is_windows_direct_console()
+            and _windows_console_handle() is not None
+        ):
+            self._draw_windows_snow_locked(positions)
+            return
+
         covered_cells = {}
-        output = []
+        drawn_chars = {}
+        draw_commands = []
         for flake, x, y in positions:
             if not self._valid_snow_position(x, y):
                 continue
@@ -962,18 +1263,53 @@ class SnowyShell:
                 )
 
             flake.saved_char, flake.saved_sgr = covered_cells[cell_position]
-            output.append(f'\x1b[{y + 1};{x + 1}H{flake.char}')
+            drawn_chars[cell_position] = flake.char
+            draw_commands.append(
+                (cell_position,
+                 f'\x1b[{y + 1};{x + 1}H{RESET_ATTRS}{flake.char}')
+            )
 
-        if output:
-            self._write_overlay(''.join(output))
+        if not self.use_pty:
+            valid_cells = {
+                (x, y)
+                for (x, y), (saved_char, _) in covered_cells.items()
+                if y >= self.shell_height or read_char_at(x, y) == saved_char
+            }
+            covered_cells = {
+                cell: value for cell, value in covered_cells.items()
+                if cell in valid_cells
+            }
+            drawn_chars = {
+                cell: char for cell, char in drawn_chars.items()
+                if cell in valid_cells
+            }
+            draw_commands = [
+                (cell, command) for cell, command in draw_commands
+                if cell in valid_cells
+            ]
+
+        if draw_commands:
+            self._write_overlay(''.join(command for _, command in draw_commands))
         self.drawn_snow = covered_cells
+        self.drawn_snow_chars = drawn_chars
 
     def _draw_ground_locked(self):
         """Redraw settled snow in the two protected physical rows."""
         if not self.ground:
             return
+
+        if (
+            self._is_windows_direct_console()
+            and _windows_console_handle() is not None
+        ):
+            attributes = self._windows_snow_attributes()
+            for (x, y), char in sorted(self.ground.items()):
+                if self._valid_snow_position(x, y):
+                    _write_console_cell_windows(x, y, char, attributes)
+            return
+
         output = [
-            f'\x1b[{y + 1};{x + 1}H{char}'
+            f'\x1b[{y + 1};{x + 1}H{RESET_ATTRS}{char}'
             for (x, y), char in sorted(self.ground.items())
             if self._valid_snow_position(x, y)
         ]
@@ -989,6 +1325,19 @@ class SnowyShell:
         self.ground = {}
         if not self.ground_rows:
             return
+
+        if (
+            self._is_windows_direct_console()
+            and _windows_console_handle() is not None
+        ):
+            if _clear_console_region_windows(
+                self.shell_height,
+                self.height,
+                self.width,
+                self._windows_snow_attributes(),
+            ):
+                return
+
         output = ''.join(
             f'\x1b[{row + 1};1H\x1b[2K'
             for row in range(self.shell_height, self.height)
@@ -1032,8 +1381,8 @@ class SnowyShell:
             DEC_SAVE_CURSOR + RESET_SCROLL_REGION + DEC_RESTORE_CURSOR
         )
 
-    def _forward_pty_output(self, text):
-        """Remove snow, update the screen model, then forward one PTY chunk."""
+    def _forward_output(self, text):
+        """Remove snow, update the screen model, then forward one output chunk."""
         with self.lock:
             self._erase_snow_locked()
             filtered = self.output_filter.feed(text) if self.output_filter else text
@@ -1131,7 +1480,7 @@ class SnowyShell:
                         break
                     text = data.decode('utf-8', errors='replace')
 
-                    self._forward_pty_output(text)
+                    self._forward_output(text)
             except OSError:
                 break
             except Exception:

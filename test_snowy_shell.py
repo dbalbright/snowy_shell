@@ -18,6 +18,15 @@ from snowy_shell import (
     DEFAULT_SNOWFLAKES, UNICODE_SNOWFLAKES,
 )
 
+
+def enable_screen_model(app):
+    """Configure a test app to use the Unix-style screen model."""
+    app.use_pty = True
+    app.screen_buffer = ScreenBuffer(app.width, app.shell_height)
+    app.ansi_parser = AnsiParser(app.screen_buffer)
+    app.output_filter = PtyOutputFilter(app.shell_height)
+    return app
+
 def test_terminal_size():
     """Test terminal size detection."""
     w, h = Terminal.get_size()
@@ -100,7 +109,12 @@ def test_batch_update():
     app = SnowyShell(density=2.0, speed=1.0)
     app.width, app.height = 80, 24
     app.init_snowflakes()
-    
+
+    # Place every flake in view so the frame deterministically emits commands.
+    for flake in app.snowflakes:
+        flake.x = 40.0
+        flake.y = 10.0
+
     # Simulate one frame of updates
     output = []
     for flake in app.snowflakes:
@@ -109,7 +123,7 @@ def test_batch_update():
             output.append(f'\x1b[{old_y + 1};{old_x + 1}H ')
         if 0 <= new_y < 24 and 0 <= new_x < 80:
             output.append(f'\x1b[{new_y + 1};{new_x + 1}H{flake.char}')
-    
+
     print(f"  Generated {len(output)} draw commands for {len(app.snowflakes)} snowflakes")
     assert len(output) > 0, "Should generate draw commands"
     print("  PASS: batch update works")
@@ -221,7 +235,6 @@ def test_unix_reserves_two_ground_rows():
 def test_non_pty_reserves_and_protects_ground_rows():
     """Test Windows-style rendering reserves rows and applies VT margins."""
     app = SnowyShell()
-    app.use_pty = False
     app.screen_buffer = None
     app.output_filter = None
     output = []
@@ -243,26 +256,134 @@ def test_non_pty_reserves_and_protects_ground_rows():
     print("  PASS: non-PTY mode protects two ground rows")
 
 def test_non_pty_overlay_restores_shell_and_ground():
-    """Test Windows-style erasure uses saved shell and canonical ground cells."""
+    """Test Windows erasure uses saved shell and canonical ground cells."""
     app = SnowyShell()
-    app.use_pty = False
     app.screen_buffer = None
+    app.output_filter = None
     app.ground[(2, app.height - 1)] = '+'
     app.drawn_snow = {
         (1, 0): ('S', None),
         (2, app.height - 1): ('*', None),
     }
+    app.drawn_snow_chars = {
+        (1, 0): 'o',
+        (2, app.height - 1): '*',
+    }
     output = []
     app.write_terminal = output.append
 
-    with patch('snowy_shell.read_char_at', return_value='F'):
+    with patch('snowy_shell.read_char_at', return_value='o'):
         app._erase_snow_locked()
 
-    assert '\x1b[1;2HS' in output[0]
-    assert f'\x1b[{app.height};3H+' in output[0]
-    assert 'F' not in output[0]
+    assert '\x1b[1;2H\x1b[0mS' in output[0]
+    assert f'\x1b[{app.height};3H\x1b[0m+' in output[0]
     assert app.drawn_snow == {}
+    assert app.drawn_snow_chars == {}
     print("  PASS: non-PTY overlays restore shell and ground cells")
+
+def test_overlay_restores_latest_model_cell():
+    """Test erasure restores the newest shell content from the screen model."""
+    app = enable_screen_model(SnowyShell())
+    app.screen_buffer.set_cursor(1, 0)
+    app.screen_buffer.write_char('N')
+    app.drawn_snow = {(1, 0): (' ', None)}
+    app.drawn_snow_chars = {(1, 0): '*'}
+    output = []
+    app.write_terminal = output.append
+
+    app._erase_snow_locked()
+
+    assert '\x1b[1;2H\x1b[0mN' in output[0]
+    assert app.drawn_snow == {}
+    assert app.drawn_snow_chars == {}
+    print("  PASS: overlay erasure restores the newest model cell")
+
+def test_overlay_draw_records_model_underlying():
+    """Test drawing records the model cell and resets flake attributes."""
+    app = enable_screen_model(SnowyShell())
+    app.screen_buffer.set_cursor(1, 0)
+    app.screen_buffer.process_sgr([31])
+    app.screen_buffer.write_char('R')
+    flake = Snowflake(app.width, app.height, ['*'])
+    output = []
+    app.write_terminal = output.append
+
+    app._draw_snow_locked([(flake, 1, 0)])
+
+    assert '\x1b[1;2H\x1b[0m*' in output[0]
+    assert app.drawn_snow[(1, 0)][0] == 'R'
+    assert app.drawn_snow[(1, 0)][1]['fg'] == '31'
+    assert flake.saved_char == 'R'
+    assert flake.saved_sgr['fg'] == '31'
+    print("  PASS: drawing records the model underlying cell")
+
+def test_windows_overlay_restores_exact_console_cell():
+    """Test Windows erasure restores a matching cell and its attributes."""
+    app = SnowyShell()
+    app.drawn_snow = {(1, 0): ('A', None)}
+    app.drawn_snow_chars = {(1, 0): '*'}
+    app.drawn_snow_console = {(1, 0): ('A', 0x17)}
+    app.drawn_snow_overlay_attributes = {(1, 0): 0x07}
+    app.use_pty = False
+
+    with patch(
+        'snowy_shell._read_console_cell_windows',
+        return_value=('*', 0x07),
+    ), patch(
+        'snowy_shell._write_console_cell_windows',
+        return_value=True,
+    ) as write_cell:
+        app._erase_snow_locked()
+
+    write_cell.assert_called_once_with(1, 0, 'A', 0x17)
+    assert app.drawn_snow_console == {}
+    print("  PASS: Windows overlay restores exact console cells")
+
+def test_windows_overlay_skips_changed_console_cell():
+    """Test Windows erasure never overwrites a cell changed by the shell."""
+    app = SnowyShell()
+    app.drawn_snow = {(1, 0): ('A', None)}
+    app.drawn_snow_chars = {(1, 0): '*'}
+    app.drawn_snow_console = {(1, 0): ('A', 0x17)}
+    app.drawn_snow_overlay_attributes = {(1, 0): 0x07}
+    app.use_pty = False
+
+    with patch(
+        'snowy_shell._read_console_cell_windows',
+        return_value=('N', 0x07),
+    ), patch(
+        'snowy_shell._write_console_cell_windows',
+        return_value=True,
+    ) as write_cell:
+        app._erase_snow_locked()
+
+    write_cell.assert_not_called()
+    assert app.drawn_snow_console == {}
+    print("  PASS: Windows overlay preserves changed console cells")
+
+def test_windows_overlay_saves_console_attributes():
+    """Test Windows drawing snapshots the actual character and attributes."""
+    app = SnowyShell()
+    app.use_pty = False
+    app.windows_snow_attributes = 0x07
+    flake = Snowflake(app.width, app.height, ['*'])
+
+    with patch(
+        'snowy_shell._windows_console_handle',
+        return_value=object(),
+    ), patch(
+        'snowy_shell._read_console_cell_windows',
+        return_value=('A', 0x17),
+    ), patch(
+        'snowy_shell._write_console_cell_windows',
+        return_value=True,
+    ) as write_cell:
+        app._draw_snow_locked([(flake, 1, 0)])
+
+    write_cell.assert_called_once_with(1, 0, '*', 0x07)
+    assert app.drawn_snow_console == {(1, 0): ('A', 0x17)}
+    assert app.drawn_snow_overlay_attributes == {(1, 0): 0x07}
+    print("  PASS: Windows overlay snapshots console attributes")
 
 def test_pid_tracking():
     """Test PID tracking for signal-based control."""
@@ -295,7 +416,7 @@ def test_snow_thread_saves_chars():
 
 def test_pty_output_erases_snow_before_forwarding():
     """Test snow is removed before shell output can scroll the terminal."""
-    app = SnowyShell(density=1.0)
+    app = enable_screen_model(SnowyShell(density=1.0))
     app.screen_buffer.set_cursor(2, 1)
     app.screen_buffer.process_sgr([31])
     app.screen_buffer.write_char('X')
@@ -303,7 +424,7 @@ def test_pty_output_erases_snow_before_forwarding():
     output = []
     app.write_terminal = output.append
 
-    app._forward_pty_output('\r\nnew output')
+    app._forward_output('\r\nnew output')
 
     assert '\x1b[2;3H\x1b[31mX\x1b[0m' in output[0]
     assert output[1] == '\r\nnew output'
@@ -312,7 +433,7 @@ def test_pty_output_erases_snow_before_forwarding():
 
 def test_overlapping_snow_restores_cell_once():
     """Test overlapping flakes preserve one canonical underlying cell."""
-    app = SnowyShell(density=1.0)
+    app = enable_screen_model(SnowyShell(density=1.0))
     app.screen_buffer.set_cursor(4, 3)
     app.screen_buffer.write_char('Z')
     flakes = [Snowflake(app.width, app.height, ['*']) for _ in range(2)]
@@ -383,7 +504,7 @@ def test_full_ground_columns_refresh_on_impact():
 
 def test_ground_clears_without_reclaiming_rows():
     """Test clearing accumulation leaves Unix shell geometry reserved."""
-    app = SnowyShell(chars=['*'])
+    app = enable_screen_model(SnowyShell(chars=['*']))
     if not app.ground_rows:
         return
     app.ground[(1, app.height - 1)] = '*'
@@ -405,7 +526,7 @@ def test_ground_clears_without_reclaiming_rows():
 
 def test_ground_resize_resets_geometry():
     """Test resize clears accumulation and recomputes shell height."""
-    app = SnowyShell(chars=['*'])
+    app = enable_screen_model(SnowyShell(chars=['*']))
     app.ground[(1, app.height - 1)] = '*'
     app.write_terminal = lambda data: None
 
@@ -453,6 +574,7 @@ def test_screen_buffer_respects_scrolling_region():
 def test_unix_overlay_uses_dec_cursor_save():
     """Test Unix overlay writes preserve cursor state with DEC sequences."""
     app = SnowyShell(density=1.0)
+    app.use_pty = True
     output = []
     app.write_terminal = output.append
 
@@ -598,6 +720,11 @@ if __name__ == '__main__':
         test_unix_reserves_two_ground_rows,
         test_non_pty_reserves_and_protects_ground_rows,
         test_non_pty_overlay_restores_shell_and_ground,
+        test_overlay_restores_latest_model_cell,
+        test_overlay_draw_records_model_underlying,
+        test_windows_overlay_restores_exact_console_cell,
+        test_windows_overlay_skips_changed_console_cell,
+        test_windows_overlay_saves_console_attributes,
         test_pid_tracking,
         test_read_char_at,
         test_snowflake_saved_char,
