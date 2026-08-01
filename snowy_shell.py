@@ -827,7 +827,7 @@ class SnowyShell:
         self.use_pty = os.name != 'nt'
         self.ground_rows = (
             self.GROUND_ROWS
-            if self.use_pty and self.height - self.GROUND_ROWS >= self.MIN_SHELL_ROWS
+            if self.height - self.GROUND_ROWS >= self.MIN_SHELL_ROWS
             else 0
         )
         self.shell_height = self.height - self.ground_rows
@@ -914,12 +914,11 @@ class SnowyShell:
 
     def _valid_snow_position(self, x, y):
         """Return whether drawing at a cell cannot trigger terminal autowrap."""
-        max_x = self.width - 1 if self.use_pty else self.width
-        return 0 <= x < max_x and 0 <= y < self.height
+        return 0 <= x < self.width - 1 and 0 <= y < self.height
 
     def _underlying_cell(self, x, y):
         """Return the shell or ground content beneath a transient flake."""
-        if self.use_pty and y >= self.shell_height:
+        if self.ground_rows and y >= self.shell_height:
             return self.ground.get((x, y), ' '), None
         if self.use_pty and self.screen_buffer:
             with self.buffer_lock:
@@ -936,7 +935,7 @@ class SnowyShell:
             if not self._valid_snow_position(x, y):
                 continue
 
-            if self.use_pty:
+            if self.use_pty or (self.ground_rows and y >= self.shell_height):
                 saved_char, saved_sgr = self._underlying_cell(x, y)
 
             output.append(
@@ -957,11 +956,7 @@ class SnowyShell:
 
             cell_position = (x, y)
             if cell_position not in covered_cells:
-                if self.use_pty:
-                    char, sgr = self._underlying_cell(x, y)
-                else:
-                    char = read_char_at(x, y)
-                    sgr = None
+                char, sgr = self._underlying_cell(x, y)
                 covered_cells[cell_position] = (
                     char, dict(sgr) if sgr else None
                 )
@@ -1026,8 +1021,6 @@ class SnowyShell:
 
     def _set_terminal_region_locked(self):
         """Apply the outer terminal scrolling region for the child shell."""
-        if not self.use_pty:
-            return
         if self.ground_rows:
             region = f'\x1b[1;{self.shell_height}r'
         else:
@@ -1035,10 +1028,9 @@ class SnowyShell:
         self.write_terminal(DEC_SAVE_CURSOR + region + DEC_RESTORE_CURSOR)
 
     def _reset_terminal_region_locked(self):
-        if self.use_pty:
-            self.write_terminal(
-                DEC_SAVE_CURSOR + RESET_SCROLL_REGION + DEC_RESTORE_CURSOR
-            )
+        self.write_terminal(
+            DEC_SAVE_CURSOR + RESET_SCROLL_REGION + DEC_RESTORE_CURSOR
+        )
 
     def _forward_pty_output(self, text):
         """Remove snow, update the screen model, then forward one PTY chunk."""
@@ -1063,7 +1055,7 @@ class SnowyShell:
         self.width, self.height = width, height
         self.ground_rows = (
             self.GROUND_ROWS
-            if self.use_pty and height - self.GROUND_ROWS >= self.MIN_SHELL_ROWS
+            if height - self.GROUND_ROWS >= self.MIN_SHELL_ROWS
             else 0
         )
         self.shell_height = height - self.ground_rows
@@ -1205,6 +1197,8 @@ class SnowyShell:
             self.write_terminal(ALT_SCREEN_ENTER)
 
         self.write_terminal(f'{CLEAR_SCREEN}{CURSOR_HOME}')
+        with self.lock:
+            self._set_terminal_region_locked()
 
         snow_t = threading.Thread(target=self.snow_thread, daemon=True)
         snow_t.start()
@@ -1236,9 +1230,14 @@ class SnowyShell:
                 stderr=sys.stderr,
             )
         except Exception as e:
+            self.running = False
+            snow_t.join(timeout=1)
+            with self.lock:
+                self._erase_snow_locked()
+                self._clear_ground_locked()
+                self._reset_terminal_region_locked()
             self.write_terminal(ALT_SCREEN_EXIT)
             sys.stderr.write(f'Failed to start shell "{shell_cmd}": {e}\n')
-            self.running = False
             return
 
         try:
@@ -1251,6 +1250,8 @@ class SnowyShell:
         snow_t.join(timeout=1)
         with self.lock:
             self._erase_snow_locked()
+            self._clear_ground_locked()
+            self._reset_terminal_region_locked()
 
         if not self.no_clear:
             self.write_terminal(f'{CLEAR_SCREEN}{CURSOR_HOME}{ALT_SCREEN_EXIT}')

@@ -218,6 +218,52 @@ def test_unix_reserves_two_ground_rows():
         assert app.screen_buffer.height == app.shell_height
     print("  PASS: Unix reserves two ground rows")
 
+def test_non_pty_reserves_and_protects_ground_rows():
+    """Test Windows-style rendering reserves rows and applies VT margins."""
+    app = SnowyShell()
+    app.use_pty = False
+    app.screen_buffer = None
+    app.output_filter = None
+    output = []
+    app.write_terminal = output.append
+
+    assert app.ground_rows == 2
+    assert app.shell_height == app.height - 2
+    app._set_terminal_region_locked()
+    app._reset_terminal_region_locked()
+    assert output == [
+        DEC_SAVE_CURSOR + f'\x1b[1;{app.shell_height}r' + DEC_RESTORE_CURSOR,
+        DEC_SAVE_CURSOR + '\x1b[r' + DEC_RESTORE_CURSOR,
+    ]
+
+    app.ground[(3, app.height - 1)] = '*'
+    with patch('snowy_shell.read_char_at', return_value='X'):
+        assert app._underlying_cell(3, app.height - 1) == ('*', None)
+        assert app._underlying_cell(3, 0) == ('X', None)
+    print("  PASS: non-PTY mode protects two ground rows")
+
+def test_non_pty_overlay_restores_shell_and_ground():
+    """Test Windows-style erasure uses saved shell and canonical ground cells."""
+    app = SnowyShell()
+    app.use_pty = False
+    app.screen_buffer = None
+    app.ground[(2, app.height - 1)] = '+'
+    app.drawn_snow = {
+        (1, 0): ('S', None),
+        (2, app.height - 1): ('*', None),
+    }
+    output = []
+    app.write_terminal = output.append
+
+    with patch('snowy_shell.read_char_at', return_value='F'):
+        app._erase_snow_locked()
+
+    assert '\x1b[1;2HS' in output[0]
+    assert f'\x1b[{app.height};3H+' in output[0]
+    assert 'F' not in output[0]
+    assert app.drawn_snow == {}
+    print("  PASS: non-PTY overlays restore shell and ground cells")
+
 def test_pid_tracking():
     """Test PID tracking for signal-based control."""
     app = SnowyShell()
@@ -299,7 +345,8 @@ def test_ground_accumulates_bottom_then_top():
     flake.char = '+'
     assert app._settle_or_position(flake, x, app.shell_height) is None
     assert app.ground[(x, app.shell_height)] == '+'
-    assert app._settle_or_position(flake, x, app.shell_height) is None
+    with patch('snowy_shell.random.random', return_value=1.0):
+        assert app._settle_or_position(flake, x, app.shell_height) is None
     assert len(app.ground) == 2
     print("  PASS: ground accumulates bottom then top")
 
@@ -414,7 +461,7 @@ def test_unix_overlay_uses_dec_cursor_save():
     assert output == [DEC_SAVE_CURSOR + '\x1b[2;3H*' + DEC_RESTORE_CURSOR]
     print("  PASS: Unix overlay uses DEC cursor save and restore")
 
-def test_snow_skips_last_column_on_unix():
+def test_snow_skips_last_column():
     """Test snow cannot leave the terminal in an autowrap-pending state."""
     app = SnowyShell(density=1.0)
     flake = Snowflake(app.width, app.height, ['*'])
@@ -426,7 +473,7 @@ def test_snow_skips_last_column_on_unix():
 
     assert output == []
     assert app.drawn_snow == {}
-    print("  PASS: Unix snow skips the terminal's final column")
+    print("  PASS: snow skips the terminal's final column")
 
 def test_ansi_parser_dec_cursor_save_restore():
     """Test screen tracking understands DEC overlay cursor preservation."""
@@ -549,6 +596,8 @@ if __name__ == '__main__':
         test_snowflake_update_with_bounds,
         test_no_snow_option,
         test_unix_reserves_two_ground_rows,
+        test_non_pty_reserves_and_protects_ground_rows,
+        test_non_pty_overlay_restores_shell_and_ground,
         test_pid_tracking,
         test_read_char_at,
         test_snowflake_saved_char,
@@ -562,7 +611,7 @@ if __name__ == '__main__':
         test_pty_output_filter_protects_ground_rows,
         test_screen_buffer_respects_scrolling_region,
         test_unix_overlay_uses_dec_cursor_save,
-        test_snow_skips_last_column_on_unix,
+        test_snow_skips_last_column,
         test_ansi_parser_dec_cursor_save_restore,
         test_sgr_dict_to_ansi,
         test_terminal_cell,

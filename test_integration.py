@@ -93,6 +93,8 @@ def test_snowy_shell_integration():
         has_alt_screen = '\x1b[?1049h' in stdout
         has_alt_exit = '\x1b[?1049l' in stdout
         has_clear = '\x1b[2J' in stdout
+        has_protected_region = re.search(r'\x1b\[1;\d+r', stdout) is not None
+        has_region_reset = '\x1b[r' in stdout
 
         # Check for any snowflake character (from DEFAULT_SNOWFLAKES)
         snowflake_chars = ['*', '+', '.', "'", 'o', 'O']
@@ -102,6 +104,8 @@ def test_snowy_shell_integration():
         print(f'Has alt screen enter: {has_alt_screen}')
         print(f'Has alt screen exit: {has_alt_exit}')
         print(f'Has clear screen: {has_clear}')
+        print(f'Has protected scroll region: {has_protected_region}')
+        print(f'Has scroll region reset: {has_region_reset}')
         print(f'Has snowflake chars: {has_snowflake}')
         print(f'Has shell output: {has_shell_output}')
 
@@ -116,6 +120,8 @@ def test_snowy_shell_integration():
         assert has_alt_screen, "Should enter alternate screen buffer"
         assert has_alt_exit, "Should exit alternate screen buffer"
         assert has_clear, "Should clear screen"
+        assert has_protected_region, "Should reserve ground rows"
+        assert has_region_reset, "Should restore the full scroll region"
         assert has_snowflake, "Should draw snowflakes"
         assert has_shell_output, "Should have shell output"
 
