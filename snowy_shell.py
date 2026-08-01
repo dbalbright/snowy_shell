@@ -53,6 +53,8 @@ if os.name != 'nt':
 # ANSI escape codes
 SAVE_CURSOR = '\x1b[s'
 RESTORE_CURSOR = '\x1b[u'
+DEC_SAVE_CURSOR = '\x1b7'
+DEC_RESTORE_CURSOR = '\x1b8'
 CLEAR_SCREEN = '\x1b[2J'
 CURSOR_HOME = '\x1b[H'
 HIDE_CURSOR = '\x1b[?25l'
@@ -226,6 +228,10 @@ class ScreenBuffer:
         self.cells = [[TerminalCell() for _ in range(width)] for _ in range(height)]
         self.cursor_x = 0
         self.cursor_y = 0
+        self.wrap_pending = False
+        self.saved_cursor_x = 0
+        self.saved_cursor_y = 0
+        self.saved_wrap_pending = False
         self.sgr_state = {}  # Current SGR state
         self._reset_sgr()
 
@@ -247,15 +253,25 @@ class ScreenBuffer:
 
     def write_char(self, char):
         """Write a character at the current cursor position and advance."""
+        if self.wrap_pending:
+            self.cursor_x = 0
+            self.linefeed()
+            self.wrap_pending = False
+
         if 0 <= self.cursor_y < self.height and 0 <= self.cursor_x < self.width:
             cell = self.cells[self.cursor_y][self.cursor_x]
             cell.set(char, self.sgr_state)
-            self.cursor_x += 1
+            if self.cursor_x == self.width - 1:
+                # Terminals defer autowrap until the next printable character.
+                self.wrap_pending = True
+            else:
+                self.cursor_x += 1
 
     def set_cursor(self, x, y):
         """Set cursor position (0-based)."""
         self.cursor_x = max(0, min(x, self.width - 1))
         self.cursor_y = max(0, min(y, self.height - 1))
+        self.wrap_pending = False
 
     def process_sgr(self, params):
         """Process SGR (Select Graphic Rendition) parameters."""
@@ -365,6 +381,10 @@ class ScreenBuffer:
         self.cells = [[TerminalCell() for _ in range(width)] for _ in range(height)]
         self.cursor_x = 0
         self.cursor_y = 0
+        self.wrap_pending = False
+        self.saved_cursor_x = 0
+        self.saved_cursor_y = 0
+        self.saved_wrap_pending = False
         self._reset_sgr()
 
     def get_attrs_at(self, x, y):
@@ -440,7 +460,18 @@ class AnsiParser:
                         self.screen.clear_screen()
                         self.screen.cursor_x = 0
                         self.screen.cursor_y = 0
+                        self.screen.wrap_pending = False
                         self.screen._reset_sgr()
+                    elif self.buffer[1] == '7':
+                        self.screen.saved_cursor_x = self.screen.cursor_x
+                        self.screen.saved_cursor_y = self.screen.cursor_y
+                        self.screen.saved_wrap_pending = self.screen.wrap_pending
+                    elif self.buffer[1] == '8':
+                        self.screen.set_cursor(
+                            self.screen.saved_cursor_x,
+                            self.screen.saved_cursor_y,
+                        )
+                        self.screen.wrap_pending = self.screen.saved_wrap_pending
                     self.buffer = self.buffer[2:]
                 else:
                     break
@@ -506,21 +537,25 @@ class AnsiParser:
             # Cursor Up
             count = params[0] if params else 1
             self.screen.cursor_y = max(0, self.screen.cursor_y - count)
+            self.screen.wrap_pending = False
 
         elif command == 'B':
             # Cursor Down
             count = params[0] if params else 1
             self.screen.cursor_y = min(self.screen.height - 1, self.screen.cursor_y + count)
+            self.screen.wrap_pending = False
 
         elif command == 'C':
             # Cursor Forward
             count = params[0] if params else 1
             self.screen.cursor_x = min(self.screen.width - 1, self.screen.cursor_x + count)
+            self.screen.wrap_pending = False
 
         elif command == 'D':
             # Cursor Back
             count = params[0] if params else 1
             self.screen.cursor_x = max(0, self.screen.cursor_x - count)
+            self.screen.wrap_pending = False
 
         elif command == 'J':
             # Erase Display
@@ -556,6 +591,16 @@ class AnsiParser:
             # SGR: Select Graphic Rendition
             self.screen.process_sgr(params if params else [0])
 
+        elif command == 's':
+            self.screen.saved_cursor_x = self.screen.cursor_x
+            self.screen.saved_cursor_y = self.screen.cursor_y
+            self.screen.saved_wrap_pending = self.screen.wrap_pending
+
+        elif command == 'u':
+            self.screen.set_cursor(
+                self.screen.saved_cursor_x, self.screen.saved_cursor_y)
+            self.screen.wrap_pending = self.screen.saved_wrap_pending
+
         elif command == 'h' or command == 'l':
             # Set/Reset mode - we mostly ignore these for screen buffer purposes
             pass
@@ -569,21 +614,21 @@ class AnsiParser:
         for char in text:
             if char == '\n':
                 self.screen.linefeed()
+                self.screen.wrap_pending = False
             elif char == '\r':
                 self.screen.cursor_x = 0
+                self.screen.wrap_pending = False
             elif char == '\t':
+                self.screen.wrap_pending = False
                 self.screen.cursor_x = ((self.screen.cursor_x // 8) + 1) * 8
                 if self.screen.cursor_x >= self.screen.width:
                     self.screen.cursor_x = self.screen.width - 1
             elif char == '\x08':
                 # Backspace
+                self.screen.wrap_pending = False
                 self.screen.cursor_x = max(0, self.screen.cursor_x - 1)
             else:
                 self.screen.write_char(char)
-                # Handle line wrapping
-                if self.screen.cursor_x >= self.screen.width:
-                    self.screen.cursor_x = 0
-                    self.screen.linefeed()
 
 
 class Snowflake:
@@ -641,6 +686,7 @@ class SnowyShell:
         self.snow_enabled = not no_snow
         self.shell_proc = None
         self.snowflakes = []
+        self.drawn_snow = {}
         self.width, self.height = Terminal.get_size()
         self.lock = threading.Lock()
         self.buffer_lock = threading.Lock()
@@ -717,6 +763,89 @@ class SnowyShell:
 
         return False
 
+    def _format_restored_cell(self, x, y, char, sgr):
+        """Build the terminal sequence that restores one snow-covered cell."""
+        position = f'\x1b[{y + 1};{x + 1}H'
+        sgr_ansi = sgr_dict_to_ansi(sgr)
+        if sgr_ansi:
+            return f'{position}{sgr_ansi}{char}{RESET_ATTRS}'
+        return f'{position}{char}'
+
+    def _write_overlay(self, output):
+        """Write an overlay update without disturbing the shell cursor."""
+        if self.use_pty:
+            self.write_terminal(DEC_SAVE_CURSOR + output + DEC_RESTORE_CURSOR)
+        else:
+            self.write_terminal(SAVE_CURSOR + output + RESTORE_CURSOR)
+
+    def _valid_snow_position(self, x, y):
+        """Return whether drawing at a cell cannot trigger terminal autowrap."""
+        max_x = self.width - 1 if self.use_pty else self.width
+        return 0 <= x < max_x and 0 <= y < self.height
+
+    def _erase_snow_locked(self):
+        """Erase the currently visible overlay while holding self.lock."""
+        if not self.drawn_snow:
+            return
+
+        output = []
+        for (x, y), (saved_char, saved_sgr) in self.drawn_snow.items():
+            if not self._valid_snow_position(x, y):
+                continue
+
+            if self.use_pty and self.screen_buffer:
+                with self.buffer_lock:
+                    saved_char, saved_sgr = self.screen_buffer.get_attrs_at(x, y)
+
+            output.append(
+                self._format_restored_cell(x, y, saved_char, saved_sgr)
+            )
+
+        if output:
+            self._write_overlay(''.join(output))
+        self.drawn_snow = {}
+
+    def _draw_snow_locked(self, positions):
+        """Draw a snow frame and record each covered cell while holding self.lock."""
+        covered_cells = {}
+        output = []
+        for flake, x, y in positions:
+            if not self._valid_snow_position(x, y):
+                continue
+
+            cell_position = (x, y)
+            if cell_position not in covered_cells:
+                if self.use_pty and self.screen_buffer:
+                    with self.buffer_lock:
+                        char, sgr = self.screen_buffer.get_attrs_at(x, y)
+                else:
+                    char = read_char_at(x, y)
+                    sgr = None
+                covered_cells[cell_position] = (
+                    char, dict(sgr) if sgr else None
+                )
+
+            flake.saved_char, flake.saved_sgr = covered_cells[cell_position]
+            output.append(f'\x1b[{y + 1};{x + 1}H{flake.char}')
+
+        if output:
+            self._write_overlay(''.join(output))
+        self.drawn_snow = covered_cells
+
+    def _forward_pty_output(self, text):
+        """Remove snow, update the screen model, then forward one PTY chunk."""
+        with self.lock:
+            self._erase_snow_locked()
+            if self.ansi_parser:
+                try:
+                    with self.buffer_lock:
+                        self.ansi_parser.feed(text)
+                except Exception:
+                    # Screen tracking must never prevent shell output.
+                    with self.buffer_lock:
+                        self.ansi_parser = AnsiParser(self.screen_buffer)
+            self.write_terminal(text)
+
     def snow_thread(self):
         """Background thread that animates snowflakes."""
         last_check = 0
@@ -729,6 +858,8 @@ class SnowyShell:
                 last_check = now
 
             if not self.snow_enabled:
+                with self.lock:
+                    self._erase_snow_locked()
                 time.sleep(0.1)
                 continue
 
@@ -736,58 +867,24 @@ class SnowyShell:
             w, h = Terminal.get_size()
             if w != self.width or h != self.height:
                 with self.resize_lock:
-                    self.width, self.height = w, h
-                    self.init_snowflakes()
-                    if self.screen_buffer:
-                        self.screen_buffer.resize(w, h)
-                    if self.master_fd is not None and self.pty_proc:
-                        self._update_pty_size()
+                    with self.lock:
+                        self._erase_snow_locked()
+                        self.width, self.height = w, h
+                        self.init_snowflakes()
+                        if self.screen_buffer:
+                            with self.buffer_lock:
+                                self.screen_buffer.resize(w, h)
+                        if self.master_fd is not None and self.pty_proc:
+                            self._update_pty_size()
 
-            # Two-phase update: erase all flakes first, then read+draw
-            erase_output = []
             new_positions = []
             for flake in self.snowflakes:
-                old_x, old_y, new_x, new_y = flake.update()
-
-                # Phase 1: Erase old position by restoring saved character + attrs
-                if old_y is not None and 0 <= old_y < self.height and 0 <= old_x < self.width:
-                    if self.use_pty and flake.saved_sgr is not None:
-                        sgr_ansi = sgr_dict_to_ansi(flake.saved_sgr)
-                        if sgr_ansi:
-                            erase_output.append(
-                                f'\x1b[{old_y + 1};{old_x + 1}H{sgr_ansi}{flake.saved_char}{RESET_ATTRS}'
-                            )
-                        else:
-                            erase_output.append(f'\x1b[{old_y + 1};{old_x + 1}H{flake.saved_char}')
-                    else:
-                        erase_output.append(f'\x1b[{old_y + 1};{old_x + 1}H{flake.saved_char}')
-
+                _, _, new_x, new_y = flake.update()
                 new_positions.append((flake, new_x, new_y))
 
-            # Write all erasures to terminal
-            if erase_output:
-                with self.lock:
-                    self.write_terminal(SAVE_CURSOR + ''.join(erase_output) + RESTORE_CURSOR)
-
-            # Phase 2: Save chars at new positions and draw flakes
-            draw_output = []
-            for flake, new_x, new_y in new_positions:
-                if 0 <= new_y < self.height and 0 <= new_x < self.width:
-                    if self.use_pty and self.screen_buffer:
-                        with self.buffer_lock:
-                            char, sgr = self.screen_buffer.get_attrs_at(new_x, new_y)
-                        flake.saved_char = char
-                        # Store a copy to avoid mutation by the parser
-                        flake.saved_sgr = dict(sgr) if sgr else None
-                    else:
-                        flake.saved_char = read_char_at(new_x, new_y)
-                        flake.saved_sgr = None
-                    draw_output.append(f'\x1b[{new_y + 1};{new_x + 1}H{flake.char}')
-
-            # Write all drawings to terminal
-            if draw_output:
-                with self.lock:
-                    self.write_terminal(SAVE_CURSOR + ''.join(draw_output) + RESTORE_CURSOR)
+            with self.lock:
+                self._erase_snow_locked()
+                self._draw_snow_locked(new_positions)
 
             time.sleep(0.05 / max(0.1, self.speed))
 
@@ -812,19 +909,7 @@ class SnowyShell:
                         break
                     text = data.decode('utf-8', errors='replace')
 
-                    # Parse ANSI and update screen buffer
-                    if self.ansi_parser:
-                        try:
-                            with self.buffer_lock:
-                                self.ansi_parser.feed(text)
-                        except Exception:
-                            # Screen tracking must never prevent shell output.
-                            with self.buffer_lock:
-                                self.ansi_parser = AnsiParser(self.screen_buffer)
-
-                    # Forward to real terminal
-                    with self.lock:
-                        self.write_terminal(text)
+                    self._forward_pty_output(text)
             except OSError:
                 break
             except Exception:
@@ -880,12 +965,15 @@ class SnowyShell:
         w, h = Terminal.get_size()
         if w != self.width or h != self.height:
             with self.resize_lock:
-                self.width, self.height = w, h
-                self.init_snowflakes()
-                if self.screen_buffer:
-                    self.screen_buffer.resize(w, h)
-                if self.master_fd is not None:
-                    self._update_pty_size()
+                with self.lock:
+                    self._erase_snow_locked()
+                    self.width, self.height = w, h
+                    self.init_snowflakes()
+                    if self.screen_buffer:
+                        with self.buffer_lock:
+                            self.screen_buffer.resize(w, h)
+                    if self.master_fd is not None:
+                        self._update_pty_size()
 
     def run_without_pty(self):
         """Run the snowy shell without PTY (Windows or fallback)."""
@@ -936,6 +1024,10 @@ class SnowyShell:
             pass
         finally:
             self.running = False
+
+        snow_t.join(timeout=1)
+        with self.lock:
+            self._erase_snow_locked()
 
         if not self.no_clear:
             self.write_terminal(f'{CLEAR_SCREEN}{CURSOR_HOME}{ALT_SCREEN_EXIT}')
@@ -1014,7 +1106,10 @@ class SnowyShell:
             finally:
                 self.running = False
 
-            # The child may exit before the reader consumes its last output.
+            # Stop snow first, then let the reader drain the child's last output.
+            snow_t.join(timeout=1)
+            with self.lock:
+                self._erase_snow_locked()
             output_t.join(timeout=2)
 
             # Clean up after the output reader has drained the PTY.

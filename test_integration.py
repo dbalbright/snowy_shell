@@ -8,6 +8,8 @@ import subprocess
 import sys
 import time
 
+from snowy_shell import AnsiParser, ScreenBuffer
+
 
 def test_unix_interactive_shell(shell='/bin/sh'):
     """Verify a Unix shell gets a controlling terminal and relays input/output."""
@@ -128,9 +130,81 @@ def test_snowy_shell_integration():
             print(f'Stderr: {repr(stderr[:300])}')
         return False
 
+def test_scrolling_output_preserves_text():
+    """Verify snow does not become embedded when command output scrolls."""
+    if os.name == 'nt':
+        return True
+
+    command = (
+        "sleep 0.2; i=1; while [ $i -le 40 ]; do "
+        "printf 'ROW%02d preserved text\\n' $i; "
+        "sleep 0.01; i=$((i + 1)); done"
+    )
+    proc = subprocess.run(
+        [
+            sys.executable, 'snowy_shell.py', '--no-clear',
+            '--shell', '/bin/sh', '--density', '10', '--chars', '*', command,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=15,
+    )
+    assert proc.returncode == 0, proc.stderr.decode('utf-8', errors='replace')
+
+    screen = ScreenBuffer(80, 24)
+    AnsiParser(screen).feed(proc.stdout.decode('utf-8', errors='replace'))
+    lines = [''.join(cell.char for cell in row).rstrip() for row in screen.cells]
+    expected = [f'ROW{i:02d} preserved text' for i in range(18, 41)] + ['']
+    assert lines == expected, '\n'.join(lines)
+    print('Scrolling output text preservation test passed')
+    return True
+
+def test_repeated_zsh_listings_preserve_text():
+    """Verify zsh prompt cleanup and repeated listings stay synchronized."""
+    if os.name == 'nt' or not os.path.exists('/bin/zsh'):
+        return True
+
+    command = (
+        "sleep 0.2; ls -lah; sleep 0.2; "
+        "ls -lah; sleep 0.2; ls -lah; sleep 0.2"
+    )
+    proc = subprocess.run(
+        [
+            sys.executable, 'snowy_shell.py', '--no-clear',
+            '--shell', '/bin/zsh -f', '--density', '6', command,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=15,
+    )
+    assert proc.returncode == 0, proc.stderr.decode('utf-8', errors='replace')
+
+    actual = ScreenBuffer(80, 24)
+    AnsiParser(actual).feed(proc.stdout.decode('utf-8', errors='replace'))
+
+    expected_proc = subprocess.run(
+        ['/bin/zsh', '-f', '-c', command],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=15,
+    )
+    expected = ScreenBuffer(80, 24)
+    expected_text = expected_proc.stdout.decode('utf-8', errors='replace')
+    AnsiParser(expected).feed(expected_text.replace('\n', '\r\n'))
+
+    actual_lines = [''.join(c.char for c in row) for row in actual.cells]
+    expected_lines = [''.join(c.char for c in row) for row in expected.cells]
+    assert actual_lines == expected_lines
+    print('Repeated zsh listing preservation test passed')
+    return True
+
 if __name__ == '__main__':
     success = test_unix_interactive_shell()
     if os.name != 'nt' and os.path.exists('/bin/zsh'):
         success = test_unix_interactive_shell('/bin/zsh -f') and success
     success = test_snowy_shell_integration() and success
+    success = test_scrolling_output_preserves_text() and success
+    success = test_repeated_zsh_listings_preserve_text() and success
     sys.exit(0 if success else 1)

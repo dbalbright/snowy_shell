@@ -12,6 +12,7 @@ from snowy_shell import (
     Terminal, Snowflake, SnowyShell, read_char_at, sgr_dict_to_ansi,
     TerminalCell, ScreenBuffer, AnsiParser,
     SAVE_CURSOR, RESTORE_CURSOR, CLEAR_SCREEN, CURSOR_HOME,
+    DEC_SAVE_CURSOR, DEC_RESTORE_CURSOR,
     HIDE_CURSOR, SHOW_CURSOR, ALT_SCREEN_ENTER, ALT_SCREEN_EXIT,
     DEFAULT_SNOWFLAKES, UNICODE_SNOWFLAKES,
 )
@@ -236,6 +237,74 @@ def test_snow_thread_saves_chars():
         assert hasattr(flake, 'saved_char'), "Flake should have saved_char"
     print("  PASS: snow thread saves characters")
 
+def test_pty_output_erases_snow_before_forwarding():
+    """Test snow is removed before shell output can scroll the terminal."""
+    app = SnowyShell(density=1.0)
+    app.screen_buffer.set_cursor(2, 1)
+    app.screen_buffer.process_sgr([31])
+    app.screen_buffer.write_char('X')
+    app.drawn_snow = {(2, 1): (' ', None)}
+    output = []
+    app.write_terminal = output.append
+
+    app._forward_pty_output('\r\nnew output')
+
+    assert '\x1b[2;3H\x1b[31mX\x1b[0m' in output[0]
+    assert output[1] == '\r\nnew output'
+    assert app.drawn_snow == {}
+    print("  PASS: PTY output erases snow before forwarding")
+
+def test_overlapping_snow_restores_cell_once():
+    """Test overlapping flakes preserve one canonical underlying cell."""
+    app = SnowyShell(density=1.0)
+    app.screen_buffer.set_cursor(4, 3)
+    app.screen_buffer.write_char('Z')
+    flakes = [Snowflake(app.width, app.height, ['*']) for _ in range(2)]
+    output = []
+    app.write_terminal = output.append
+
+    with app.lock:
+        app._draw_snow_locked([(flakes[0], 4, 3), (flakes[1], 4, 3)])
+        app._erase_snow_locked()
+
+    assert len(output) == 2
+    assert output[1].count('\x1b[4;5H') == 1
+    assert 'Z' in output[1]
+    print("  PASS: overlapping snow restores its underlying cell once")
+
+def test_unix_overlay_uses_dec_cursor_save():
+    """Test Unix overlay writes preserve cursor state with DEC sequences."""
+    app = SnowyShell(density=1.0)
+    output = []
+    app.write_terminal = output.append
+
+    app._write_overlay('\x1b[2;3H*')
+
+    assert output == [DEC_SAVE_CURSOR + '\x1b[2;3H*' + DEC_RESTORE_CURSOR]
+    print("  PASS: Unix overlay uses DEC cursor save and restore")
+
+def test_snow_skips_last_column_on_unix():
+    """Test snow cannot leave the terminal in an autowrap-pending state."""
+    app = SnowyShell(density=1.0)
+    flake = Snowflake(app.width, app.height, ['*'])
+    output = []
+    app.write_terminal = output.append
+
+    with app.lock:
+        app._draw_snow_locked([(flake, app.width - 1, app.height - 1)])
+
+    assert output == []
+    assert app.drawn_snow == {}
+    print("  PASS: Unix snow skips the terminal's final column")
+
+def test_ansi_parser_dec_cursor_save_restore():
+    """Test screen tracking understands DEC overlay cursor preservation."""
+    buf = ScreenBuffer(10, 5)
+    parser = AnsiParser(buf)
+    parser.feed('abc\x1b7\x1b[5;10H*\x1b8X')
+    assert buf.get_cell(3, 0).char == 'X'
+    print("  PASS: ANSI parser handles DEC cursor save and restore")
+
 def test_sgr_dict_to_ansi():
     """Test SGR dict to ANSI conversion."""
     # Default (empty) SGR
@@ -307,6 +376,26 @@ def test_screen_buffer_scrolls():
     assert ''.join(cell.char for cell in buf.cells[1]).startswith('third')
     print("  PASS: screen buffer handles terminal scrolling")
 
+def test_ansi_parser_delays_autowrap():
+    """Test a full-width line only wraps on the next printable character."""
+    buf = ScreenBuffer(5, 2)
+    parser = AnsiParser(buf)
+    parser.feed('12345\rX')
+    assert ''.join(cell.char for cell in buf.cells[0]) == 'X2345'
+    assert ''.join(cell.char for cell in buf.cells[1]) == '     '
+    assert (buf.cursor_x, buf.cursor_y) == (1, 0)
+    print("  PASS: ANSI parser delays autowrap until printable input")
+
+def test_ansi_parser_zsh_prompt_cleanup():
+    """Test zsh's terminal-width prompt cleanup does not shift the screen."""
+    buf = ScreenBuffer(10, 3)
+    parser = AnsiParser(buf)
+    parser.feed('%' + (' ' * 9) + '\r \r\rPROMPT> ')
+    assert ''.join(cell.char for cell in buf.cells[0]).startswith('PROMPT> ')
+    assert ''.join(cell.char for cell in buf.cells[1]) == ' ' * 10
+    assert buf.cursor_y == 0
+    print("  PASS: ANSI parser tracks zsh prompt cleanup")
+
 if __name__ == '__main__':
     print("=" * 60)
     print("Testing snowy_shell.py")
@@ -332,12 +421,19 @@ if __name__ == '__main__':
         test_read_char_at,
         test_snowflake_saved_char,
         test_snow_thread_saves_chars,
+        test_pty_output_erases_snow_before_forwarding,
+        test_overlapping_snow_restores_cell_once,
+        test_unix_overlay_uses_dec_cursor_save,
+        test_snow_skips_last_column_on_unix,
+        test_ansi_parser_dec_cursor_save_restore,
         test_sgr_dict_to_ansi,
         test_terminal_cell,
         test_screen_buffer,
         test_ansi_parser_simple,
         test_ansi_parser_split_sequences,
         test_screen_buffer_scrolls,
+        test_ansi_parser_delays_autowrap,
+        test_ansi_parser_zsh_prompt_cleanup,
     ]
     
     passed = 0
