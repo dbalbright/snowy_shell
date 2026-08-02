@@ -576,19 +576,44 @@ class ScreenBuffer:
                 cell.sgr = None
 
     def resize(self, width, height):
-        """Resize the screen buffer."""
+        """Resize the screen buffer, preserving existing shell text.
+
+        On resize the terminal emulator keeps the visible text. The old
+        implementation discarded all cells, causing the Unix overlay to
+        restore blank characters over real shell output after the next
+        snow erase — the macOS iTerm failure. Now we copy the overlapping
+        region and clamp cursor positions.
+        """
+        old_cells = self.cells
+        old_w = self.width
+        old_h = self.height
+
+        new_cells = [[TerminalCell() for _ in range(width)] for _ in range(height)]
+        min_h = min(old_h, height)
+        min_w = min(old_w, width)
+        for y in range(min_h):
+            old_row = old_cells[y]
+            new_row = new_cells[y]
+            for x in range(min_w):
+                oc = old_row[x]
+                nc = new_row[x]
+                nc.char = oc.char
+                nc.sgr = dict(oc.sgr) if oc.sgr else None
+
         self.width = width
         self.height = height
-        self.cells = [[TerminalCell() for _ in range(width)] for _ in range(height)]
-        self.cursor_x = 0
-        self.cursor_y = 0
+        self.cells = new_cells
+
+        self.cursor_x = max(0, min(self.cursor_x, width - 1))
+        self.cursor_y = max(0, min(self.cursor_y, height - 1))
+        self.saved_cursor_x = max(0, min(self.saved_cursor_x, width - 1))
+        self.saved_cursor_y = max(0, min(self.saved_cursor_y, height - 1))
         self.wrap_pending = False
-        self.saved_cursor_x = 0
-        self.saved_cursor_y = 0
         self.saved_wrap_pending = False
         self.scroll_top = 0
         self.scroll_bottom = height - 1
-        self._reset_sgr()
+        # Preserve current SGR state; resetting it would lose color context
+        # that remains visible after a resize.
 
     def get_attrs_at(self, x, y):
         """Get the SGR attributes at position (x, y) for restoration."""
@@ -1008,9 +1033,10 @@ class SnowyShell:
         self.drawn_snow_chars = {}
         self.ground = {}
         self.width, self.height = Terminal.get_size()
-        self.lock = threading.Lock()
-        self.buffer_lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.buffer_lock = threading.RLock()
         self.resize_lock = threading.Lock()
+        self._pending_resize = None
         self.pid = os.getpid()
 
         # The screen model is only authoritative when a real PTY is present.
@@ -1316,6 +1342,35 @@ class SnowyShell:
         if output:
             self._write_overlay(''.join(output))
 
+    def _clear_ground_visual_locked(self, start_y, end_y):
+        """Visually blank rows [start_y, end_y) using EL + explicit space fill.
+
+        `\\x1b[2K` (EL) alone is ignored by some terminals when the cursor is
+        outside an active scroll region (observed on iTerm). Writing spaces
+        with reset attributes works regardless of margins, and we keep EL for
+        backward compatibility with existing tests.
+        """
+        if not self.ground_rows or start_y >= end_y:
+            return
+        if (
+            self._is_windows_direct_console()
+            and _windows_console_handle() is not None
+        ):
+            if _clear_console_region_windows(
+                start_y,
+                end_y,
+                self.width,
+                self._windows_snow_attributes(),
+            ):
+                return
+        blank = ' ' * max(0, self.width)
+        out = ''.join(
+            f'\x1b[{row + 1};1H\x1b[2K\x1b[0m{blank}\x1b[{row + 1};1H'
+            for row in range(start_y, end_y)
+        )
+        if out:
+            self._write_overlay(out)
+
     def _clear_ground_locked(self):
         """Clear settled snow while preserving the two reserved rows."""
         for flake in self.snowflakes:
@@ -1323,26 +1378,7 @@ class SnowyShell:
         if not self.ground:
             return
         self.ground = {}
-        if not self.ground_rows:
-            return
-
-        if (
-            self._is_windows_direct_console()
-            and _windows_console_handle() is not None
-        ):
-            if _clear_console_region_windows(
-                self.shell_height,
-                self.height,
-                self.width,
-                self._windows_snow_attributes(),
-            ):
-                return
-
-        output = ''.join(
-            f'\x1b[{row + 1};1H\x1b[2K'
-            for row in range(self.shell_height, self.height)
-        )
-        self._write_overlay(output)
+        self._clear_ground_visual_locked(self.shell_height, self.height)
 
     def _settle_or_position(self, flake, x, y):
         """Settle a flake in its column or return its transient position."""
@@ -1367,6 +1403,40 @@ class SnowyShell:
             flake.reset()
             return None
         return flake, x, y
+
+    def _redraw_screen_buffer_locked(self):
+        """Redraw preserved shell cells after a resize.
+
+        iTerm (and some other terminals) may clear or reflow the alternate
+        screen on resize. Windows keeps the content via the console API, but
+        the Unix model relies on ScreenBuffer. After preserving cells in
+        resize(), we need to push them back to the physical terminal so the
+        original text remains visible.
+        """
+        if not self.screen_buffer:
+            return
+        with self.buffer_lock:
+            out = []
+            # Redraw all non-blank cells in the shell area. Include the last
+            # column – the CUP that precedes the next cell (or the final
+            # restore) clears any autowrap-pending state.
+            for y in range(self.screen_buffer.height):
+                if y >= self.height:
+                    continue
+                for x in range(self.screen_buffer.width):
+                    if x >= self.width:
+                        continue
+                    cell = self.screen_buffer.get_cell(x, y)
+                    if cell is None:
+                        continue
+                    if cell.char == ' ' and not cell.sgr:
+                        continue
+                    out.append(self._format_restored_cell(x, y, cell.char, cell.sgr))
+            if out:
+                # Final CUP to 1,1 ensures any autowrap-pending from writing
+                # the last column is cleared before DEC restore.
+                out.append('\x1b[1;1H')
+                self._write_overlay(''.join(out))
 
     def _set_terminal_region_locked(self):
         """Apply the outer terminal scrolling region for the child shell."""
@@ -1398,9 +1468,21 @@ class SnowyShell:
             self._draw_ground_locked()
 
     def _resize_locked(self, width, height):
-        """Resize physical, shell, snow, and PTY geometry while locked."""
+        """Resize physical, shell, snow, and PTY geometry while locked.
+
+        Clears transient snow and settled ground, then rebuilds geometry.
+        The ground must be visually cleared both before (old location) and
+        after (new location) the size change: when the window shrinks the
+        new ground rows were previously shell rows and would otherwise
+        retain old shell text instead of starting blank.
+        """
+        # Guard against degenerate sizes reported mid-drag on macOS.
+        if width < 10 or height < 5:
+            return
+
         self._erase_snow_locked()
         self._clear_ground_locked()
+
         self.width, self.height = width, height
         self.ground_rows = (
             self.GROUND_ROWS
@@ -1418,6 +1500,18 @@ class SnowyShell:
         if self.master_fd is not None:
             self._update_pty_size()
         self._set_terminal_region_locked()
+
+        # Visual clearing of the *new* ground area. _clear_ground_locked()
+        # above cleared the old ground, but after shrinking the new ground
+        # rows contain preserved shell text that must be blanked to satisfy
+        # the "reset" contract. Always blank when ground rows exist, even
+        # though self.ground is already empty.
+        self._clear_ground_visual_locked(self.shell_height, self.height)
+
+        # iTerm can clear or reflow the alternate screen on resize, while
+        # Windows preserves console cells. Redraw the preserved shell model
+        # so original text remains visible after the reset.
+        self._redraw_screen_buffer_locked()
 
     def snow_thread(self):
         """Background thread that animates snowflakes."""
@@ -1437,9 +1531,18 @@ class SnowyShell:
                 time.sleep(0.1)
                 continue
 
-            # Check for terminal resize
-            w, h = Terminal.get_size()
-            if w != self.width or h != self.height:
+            # Check for terminal resize. SIGWINCH now only sets
+            # _pending_resize; this thread is the sole owner of the actual
+            # resize, using consistent lock ordering to avoid deadlock.
+            pending = self._pending_resize
+            if pending is not None:
+                w, h = pending
+                self._pending_resize = None
+            else:
+                w, h = Terminal.get_size()
+
+            # Ignore degenerate sizes reported mid-drag on macOS.
+            if (w >= 10 and h >= 5) and (w != self.width or h != self.height):
                 with self.resize_lock:
                     with self.lock:
                         self._resize_locked(w, h)
@@ -1532,12 +1635,24 @@ class SnowyShell:
             signal.signal(signal.SIGWINCH, self._sigwinch_handler)
 
     def _sigwinch_handler(self, signum, frame):
-        """Handle terminal resize."""
-        w, h = Terminal.get_size()
+        """Handle terminal resize without risking deadlock.
+
+        The handler must be minimal – it only records the newest size.
+        The snow thread owns the actual resize and will pick up the
+        pending value under the proper lock ordering (resize_lock ->
+        lock -> buffer_lock), avoiding the classic
+        output_reader(lock->buffer_lock) vs snow_thread(resize_lock->lock)
+        vs SIGWINCH(resize_lock) deadlock that caused 'everything stops'.
+        """
+        try:
+            w, h = Terminal.get_size()
+        except Exception:
+            return
+        if w < 10 or h < 5:
+            return
+        # Store pending resize; snow_thread will apply it. No locks here.
         if w != self.width or h != self.height:
-            with self.resize_lock:
-                with self.lock:
-                    self._resize_locked(w, h)
+            self._pending_resize = (w, h)
 
     def run_without_pty(self):
         """Run the snowy shell without PTY (Windows or fallback)."""
