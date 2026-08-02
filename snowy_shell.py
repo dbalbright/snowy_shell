@@ -994,13 +994,20 @@ class Snowflake:
         self.ground_target = None
 
     def update(self, reset_at_bottom=True):
-        """Update snowflake position. Returns (old_x, old_y, new_x, new_y)."""
+        """Update snowflake position. Returns (old_x, old_y, new_x, new_y).
+
+        Both left and right edges now behave symmetrically: when a flake
+        drifts beyond the window it is clamped to an off-screen column
+        (-1 on the left, width-1 on the right) which is excluded by
+        `_valid_snow_position` (0 <= x < width-1). This makes it disappear
+        off the edge, matching the right-side behavior previously.
+        """
         self.last_x = int(self.x)
         self.last_y = int(self.y)
         self.y += self.speed
         self.x += self.drift
         if self.x < 0:
-            self.x = 0
+            self.x = -1
         elif self.x >= self.width:
             self.x = self.width - 1
         if reset_at_bottom and self.y >= self.height:
