@@ -1482,10 +1482,15 @@ class SnowyShell:
         after (new location) the size change: when the window shrinks the
         new ground rows were previously shell rows and would otherwise
         retain old shell text instead of starting blank.
+
+        The size is clamped to minimums to handle transient 0-size reports
+        during drag on both Windows Terminal and iTerm, which previously
+        caused an early return and left geometry stale (Windows regression).
         """
-        # Guard against degenerate sizes reported mid-drag on macOS.
-        if width < 10 or height < 5:
-            return
+        # Clamp degenerate sizes instead of early-returning – returning left
+        # stale geometry on Windows Terminal during drag.
+        width = max(10, width)
+        height = max(5, height)
 
         self._erase_snow_locked()
         self._clear_ground_locked()
@@ -1548,8 +1553,12 @@ class SnowyShell:
             else:
                 w, h = Terminal.get_size()
 
-            # Ignore degenerate sizes reported mid-drag on macOS.
-            if (w >= 10 and h >= 5) and (w != self.width or h != self.height):
+            # Clamp degenerate sizes (Windows Terminal can report 0 during
+            # drag) instead of ignoring – previous early-return left stale
+            # geometry and broke Windows resize after the Unix fix.
+            w = max(10, w)
+            h = max(5, h)
+            if w != self.width or h != self.height:
                 with self.resize_lock:
                     with self.lock:
                         self._resize_locked(w, h)
@@ -1655,9 +1664,10 @@ class SnowyShell:
             w, h = Terminal.get_size()
         except Exception:
             return
-        if w < 10 or h < 5:
-            return
-        # Store pending resize; snow_thread will apply it. No locks here.
+        # Clamp instead of ignoring – ignoring left stale geometry on
+        # Windows/macOS during drag and broke resize after Unix fix.
+        w = max(10, w)
+        h = max(5, h)
         if w != self.width or h != self.height:
             self._pending_resize = (w, h)
 
